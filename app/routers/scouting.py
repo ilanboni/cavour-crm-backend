@@ -1,4 +1,4 @@
-﻿from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
 from decimal import Decimal
@@ -35,19 +35,28 @@ async def lista_immobili_esterni(
     offset: int = 0,
     db: asyncpg.Pool = Depends(get_db)
 ):
-    conditions = ["attivo = \"]
+    conditions = ["attivo = $1"]
     params = [attivo]
     i = 2
     if tipo_fonte:
-        conditions.append(f"tipo_fonte = \"); params.append(tipo_fonte); i += 1
+        conditions.append(f"tipo_fonte = ${i}")
+        params.append(tipo_fonte)
+        i += 1
     if stato_contatto:
-        conditions.append(f"stato_contatto = \"); params.append(stato_contatto); i += 1
+        conditions.append(f"stato_contatto = ${i}")
+        params.append(stato_contatto)
+        i += 1
     if zona:
-        conditions.append(f"zona ILIKE \"); params.append(f"%{zona}%"); i += 1
+        conditions.append(f"zona ILIKE ${i}")
+        params.append(f"%{zona}%")
+        i += 1
     where = " AND ".join(conditions)
     async with db.acquire() as conn:
-        rows = await conn.fetch(f"SELECT * FROM public.immobili_esterni WHERE {where} ORDER BY created_at DESC LIMIT \ OFFSET \", *params, limit, offset)
-        total = await conn.fetchval(f"SELECT COUNT(*) FROM public.immobili_esterni WHERE {where}", *params)
+        rows = await conn.fetch(
+            f"SELECT * FROM public.immobili_esterni WHERE {where} ORDER BY created_at DESC LIMIT ${i} OFFSET ${i+1}",
+            *params, limit, offset)
+        total = await conn.fetchval(
+            f"SELECT COUNT(*) FROM public.immobili_esterni WHERE {where}", *params)
     return {"data": [dict(r) for r in rows], "total": total}
 
 @router.get("/privati")
@@ -56,10 +65,14 @@ async def lista_privati(zona: Optional[str] = None, limit: int = 50, db: asyncpg
     params = []
     i = 1
     if zona:
-        conditions.append(f"zona ILIKE \"); params.append(f"%{zona}%"); i += 1
+        conditions.append(f"zona ILIKE ${i}")
+        params.append(f"%{zona}%")
+        i += 1
     where = " AND ".join(conditions)
     async with db.acquire() as conn:
-        rows = await conn.fetch(f"SELECT * FROM public.immobili_esterni WHERE {where} ORDER BY created_at DESC LIMIT \", *params, limit)
+        rows = await conn.fetch(
+            f"SELECT * FROM public.immobili_esterni WHERE {where} ORDER BY created_at DESC LIMIT ${i}",
+            *params, limit)
     return [dict(r) for r in rows]
 
 @router.get("/multiagenzia")
@@ -68,16 +81,21 @@ async def lista_multiagenzia(zona: Optional[str] = None, limit: int = 50, db: as
     params = []
     i = 1
     if zona:
-        conditions.append(f"zona ILIKE \"); params.append(f"%{zona}%"); i += 1
+        conditions.append(f"zona ILIKE ${i}")
+        params.append(f"%{zona}%")
+        i += 1
     where = " AND ".join(conditions)
     async with db.acquire() as conn:
-        rows = await conn.fetch(f"SELECT * FROM public.immobili_esterni WHERE {where} ORDER BY score_compatibilita DESC LIMIT \", *params, limit)
+        rows = await conn.fetch(
+            f"SELECT * FROM public.immobili_esterni WHERE {where} ORDER BY score_compatibilita DESC LIMIT ${i}",
+            *params, limit)
     return [dict(r) for r in rows]
 
 @router.get("/{immobile_id}")
 async def get_immobile_esterno(immobile_id: int, db: asyncpg.Pool = Depends(get_db)):
     async with db.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM public.immobili_esterni WHERE id = \", immobile_id)
+        row = await conn.fetchrow(
+            "SELECT * FROM public.immobili_esterni WHERE id = $1", immobile_id)
     if not row:
         raise HTTPException(status_code=404, detail="Immobile non trovato")
     return dict(row)
@@ -86,7 +104,8 @@ async def get_immobile_esterno(immobile_id: int, db: asyncpg.Pool = Depends(get_
 async def crea_immobile_esterno(imm: ImmobileEsternoCreate, db: asyncpg.Pool = Depends(get_db)):
     async with db.acquire() as conn:
         if imm.id_portale:
-            existing = await conn.fetchval("SELECT id FROM public.immobili_esterni WHERE id_portale = \", imm.id_portale)
+            existing = await conn.fetchval(
+                "SELECT id FROM public.immobili_esterni WHERE id_portale = $1", imm.id_portale)
             if existing:
                 return {"id": existing, "duplicate": True}
         row = await conn.fetchrow("""
@@ -94,7 +113,7 @@ async def crea_immobile_esterno(imm: ImmobileEsternoCreate, db: asyncpg.Pool = D
                 (titolo, descrizione, indirizzo, zona, citta, mq, camere,
                  prezzo, contatto_nome, contatto_telefono, url_annuncio,
                  tipo_fonte, fonte, testo_originale, id_portale)
-            VALUES (\,\,\,\,\,\,\,\,\,\,\,\,\,\,\)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
             RETURNING *
         """, imm.titolo, imm.descrizione, imm.indirizzo, imm.zona, imm.citta,
             imm.mq, imm.camere, imm.prezzo, imm.contatto_nome,
@@ -107,10 +126,11 @@ async def aggiorna_stato(immobile_id: int, stato: str, messaggio: Optional[str] 
     async with db.acquire() as conn:
         row = await conn.fetchrow("""
             UPDATE public.immobili_esterni
-            SET stato_contatto = \, messaggio_inviato = COALESCE(\, messaggio_inviato),
-                data_contatto = CASE WHEN \ = 'contattato' THEN NOW() ELSE data_contatto END,
+            SET stato_contatto = $2,
+                messaggio_inviato = COALESCE($3, messaggio_inviato),
+                data_contatto = CASE WHEN $2 = 'contattato' THEN NOW() ELSE data_contatto END,
                 updated_at = NOW()
-            WHERE id = \ RETURNING *
+            WHERE id = $1 RETURNING *
         """, immobile_id, stato, messaggio)
     if not row:
         raise HTTPException(status_code=404, detail="Immobile non trovato")
@@ -133,5 +153,6 @@ async def scouting_oggi(db: asyncpg.Pool = Depends(get_db)):
 @scouting_router.get("/report/{data}")
 async def report_giornaliero(data: str, db: asyncpg.Pool = Depends(get_db)):
     async with db.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM public.report_giornaliero WHERE data = \", data)
+        row = await conn.fetchrow(
+            "SELECT * FROM public.report_giornaliero WHERE data = $1", data)
     return dict(row) if row else {}
