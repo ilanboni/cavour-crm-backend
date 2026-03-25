@@ -1,8 +1,8 @@
-﻿from fastapi import FastAPI
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.config import get_db, close_db
-from app.routers import clienti, immobili, scouting, matching, richieste
+from app.routers import clienti, immobili, scouting, matching, richieste, coach
 from app.routers.operativo import comm_router, appt_router, doc_router
 
 @asynccontextmanager
@@ -11,9 +11,20 @@ async def lifespan(app: FastAPI):
     yield
     await close_db()
 
-app = FastAPI(title="Cavour Immobiliare CRM", version="2.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="Cavour Immobiliare CRM",
+    description="API backend per CRM immobiliare Cavour",
+    version="2.0.0",
+    lifespan=lifespan
+)
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(clienti.router)
 app.include_router(immobili.router)
@@ -24,6 +35,7 @@ app.include_router(scouting.scouting_router)
 app.include_router(comm_router)
 app.include_router(appt_router)
 app.include_router(doc_router)
+app.include_router(coach.router)
 
 @app.get("/")
 async def root():
