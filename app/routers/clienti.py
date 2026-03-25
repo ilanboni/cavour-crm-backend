@@ -1,7 +1,6 @@
-﻿from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
-from datetime import datetime
 import asyncpg
 from app.config import get_db
 
@@ -48,14 +47,19 @@ async def lista_clienti(
     params = []
     i = 1
     if attivo is not None:
-        conditions.append(f"attivo = \"); params.append(attivo); i += 1
+        conditions.append(f"attivo = ${i}")
+        params.append(attivo)
+        i += 1
     if ruolo:
-        conditions.append(f"ruolo = \"); params.append(ruolo); i += 1
+        conditions.append(f"ruolo = ${i}")
+        params.append(ruolo)
+        i += 1
     if search:
-        conditions.append(f"(nome ILIKE \ OR cognome ILIKE \ OR telefono ILIKE \)")
-        params.append(f"%{search}%"); i += 1
+        conditions.append(f"(nome ILIKE ${i} OR cognome ILIKE ${i} OR telefono ILIKE ${i})")
+        params.append(f"%{search}%")
+        i += 1
     where = " AND ".join(conditions)
-    query = f"SELECT * FROM public.clienti WHERE {where} ORDER BY updated_at DESC LIMIT \ OFFSET \"
+    query = f"SELECT * FROM public.clienti WHERE {where} ORDER BY updated_at DESC LIMIT ${i} OFFSET ${i+1}"
     params.extend([limit, offset])
     async with db.acquire() as conn:
         rows = await conn.fetch(query, *params)
@@ -65,7 +69,7 @@ async def lista_clienti(
 @router.get("/{cliente_id}")
 async def get_cliente(cliente_id: int, db: asyncpg.Pool = Depends(get_db)):
     async with db.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM public.clienti WHERE id = \", cliente_id)
+        row = await conn.fetchrow("SELECT * FROM public.clienti WHERE id = $1", cliente_id)
     if not row:
         raise HTTPException(status_code=404, detail="Cliente non trovato")
     return dict(row)
@@ -77,7 +81,7 @@ async def get_comunicazioni_cliente(cliente_id: int, db: asyncpg.Pool = Depends(
             SELECT c.*, i.titolo as immobile_titolo, i.indirizzo as immobile_indirizzo
             FROM public.comunicazioni c
             LEFT JOIN public.immobili i ON c.immobile_id = i.id
-            WHERE c.cliente_id = \ ORDER BY c.data_ora DESC
+            WHERE c.cliente_id = $1 ORDER BY c.data_ora DESC
         """, cliente_id)
     return [dict(r) for r in rows]
 
@@ -88,7 +92,7 @@ async def get_appuntamenti_cliente(cliente_id: int, db: asyncpg.Pool = Depends(g
             SELECT a.*, i.titolo as immobile_titolo
             FROM public.appuntamenti a
             LEFT JOIN public.immobili i ON a.immobile_id = i.id
-            WHERE a.cliente_id = \ ORDER BY a.data_ora DESC
+            WHERE a.cliente_id = $1 ORDER BY a.data_ora DESC
         """, cliente_id)
     return [dict(r) for r in rows]
 
@@ -99,7 +103,7 @@ async def get_documenti_cliente(cliente_id: int, db: asyncpg.Pool = Depends(get_
             SELECT d.*, i.titolo as immobile_titolo
             FROM public.documenti d
             LEFT JOIN public.immobili i ON d.immobile_id = i.id
-            WHERE d.cliente_id = \ ORDER BY d.created_at DESC
+            WHERE d.cliente_id = $1 ORDER BY d.created_at DESC
         """, cliente_id)
     return [dict(r) for r in rows]
 
@@ -111,7 +115,7 @@ async def crea_cliente(cliente: ClienteCreate, db: asyncpg.Pool = Depends(get_db
                 (appellativo, nome, cognome, telefono, email, compleanno,
                  religione, note, ruolo, fonte_acquisizione, stato_trattativa,
                  rating, cliente_amico)
-            VALUES (\,\,\,\,\,\,\,\,\,\,\,\,\)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
             RETURNING *
         """, cliente.appellativo, cliente.nome, cliente.cognome,
             cliente.telefono, cliente.email, cliente.compleanno,
@@ -125,10 +129,10 @@ async def aggiorna_cliente(cliente_id: int, cliente: ClienteUpdate, db: asyncpg.
     updates = {k: v for k, v in cliente.model_dump().items() if v is not None}
     if not updates:
         raise HTTPException(status_code=400, detail="Nessun campo da aggiornare")
-    set_clause = ", ".join([f"{k} = \" for i, k in enumerate(updates.keys())])
+    set_clause = ", ".join([f"{k} = ${i+2}" for i, k in enumerate(updates.keys())])
     async with db.acquire() as conn:
         row = await conn.fetchrow(
-            f"UPDATE public.clienti SET {set_clause}, updated_at = NOW() WHERE id = \ RETURNING *",
+            f"UPDATE public.clienti SET {set_clause}, updated_at = NOW() WHERE id = $1 RETURNING *",
             cliente_id, *list(updates.values()))
     if not row:
         raise HTTPException(status_code=404, detail="Cliente non trovato")
@@ -137,5 +141,5 @@ async def aggiorna_cliente(cliente_id: int, cliente: ClienteUpdate, db: asyncpg.
 @router.delete("/{cliente_id}")
 async def elimina_cliente(cliente_id: int, db: asyncpg.Pool = Depends(get_db)):
     async with db.acquire() as conn:
-        await conn.execute("UPDATE public.clienti SET attivo = false WHERE id = \", cliente_id)
+        await conn.execute("UPDATE public.clienti SET attivo = false WHERE id = $1", cliente_id)
     return {"success": True}
