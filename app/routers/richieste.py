@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
 from decimal import Decimal
+from datetime import date
 import asyncpg
 from app.config import get_db
 
@@ -23,6 +24,21 @@ class RichiestaCreate(BaseModel):
     urgenza: str = "normale"
     priorita: int = 3
     note_agente: Optional[str] = None
+    link_ricerca: Optional[str] = None
+    link_ricerca_immobiliare: Optional[str] = None
+
+class RichiestaUpdate(BaseModel):
+    descrizione_libera: Optional[str] = None
+    budget_massimo: Optional[Decimal] = None
+    mq_minimi: Optional[int] = None
+    mq_massimi: Optional[int] = None
+    zona: Optional[str] = None
+    urgenza: Optional[str] = None
+    priorita: Optional[int] = None
+    note_agente: Optional[str] = None
+    link_ricerca: Optional[str] = None
+    link_ricerca_immobiliare: Optional[str] = None
+    attiva: Optional[bool] = None
 
 @router.get("")
 async def lista_richieste(
@@ -44,7 +60,8 @@ async def lista_richieste(
     where = " AND ".join(conditions)
     async with db.acquire() as conn:
         rows = await conn.fetch(f"""
-            SELECT r.*, c.nome as cliente_nome, c.cognome as cliente_cognome,
+            SELECT r.*,
+                   c.nome as cliente_nome, c.cognome as cliente_cognome,
                    c.telefono as cliente_telefono
             FROM public.richieste r
             JOIN public.clienti c ON r.cliente_id = c.id
@@ -74,15 +91,36 @@ async def crea_richiesta(richiesta: RichiestaCreate, db: asyncpg.Pool = Depends(
                 (cliente_id, descrizione_libera, tipo_contratto,
                  budget_minimo, budget_massimo, mq_minimi, zona,
                  ascensore, balcone, terrazzo, box, camere_minime,
-                 urgenza, priorita, note_agente)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                 urgenza, priorita, note_agente,
+                 link_ricerca, link_ricerca_immobiliare)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
             RETURNING *
-        """, richiesta.cliente_id, richiesta.descrizione_libera,
+        """,
+            richiesta.cliente_id, richiesta.descrizione_libera,
             richiesta.tipo_contratto, richiesta.budget_minimo,
             richiesta.budget_massimo, richiesta.mq_minimi, richiesta.zona,
             richiesta.ascensore, richiesta.balcone, richiesta.terrazzo,
             richiesta.box, richiesta.camere_minime,
-            richiesta.urgenza, richiesta.priorita, richiesta.note_agente)
+            richiesta.urgenza, richiesta.priorita, richiesta.note_agente,
+            richiesta.link_ricerca, richiesta.link_ricerca_immobiliare)
+    return dict(row)
+
+@router.patch("/{richiesta_id}")
+async def aggiorna_richiesta(
+    richiesta_id: int,
+    richiesta: RichiestaUpdate,
+    db: asyncpg.Pool = Depends(get_db)
+):
+    updates = {k: v for k, v in richiesta.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(status_code=400, detail="Nessun campo da aggiornare")
+    set_clause = ", ".join([f"{k} = ${i+2}" for i, k in enumerate(updates.keys())])
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            f"UPDATE public.richieste SET {set_clause}, updated_at = NOW() WHERE id = $1 RETURNING *",
+            richiesta_id, *list(updates.values()))
+    if not row:
+        raise HTTPException(status_code=404, detail="Richiesta non trovata")
     return dict(row)
 
 @router.patch("/{richiesta_id}/disattiva")
