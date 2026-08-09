@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     ultramsg_api_key: str = os.getenv("ULTRAMSG_API_KEY", "")
     app_env: str = os.getenv("APP_ENV", "development")
     secret_key: str = os.getenv("SECRET_KEY", "dev-secret")
+    voice_secret: str = os.getenv("VOICE_SECRET", "")
 
     class Config:
         env_file = ".env"
