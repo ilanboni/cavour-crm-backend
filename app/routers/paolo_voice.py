@@ -331,6 +331,82 @@ async def contatto_posto(request: Request, db: asyncpg.Pool = Depends(get_db)):
 
 
 # ----------------------------------------------------------------------------
+# prenota (Paolo chiama il ristorante e prenota, via Vapi outbound)
+# ----------------------------------------------------------------------------
+VAPI_CALL_URL = "https://api.vapi.ai/call"
+BOOKING_ASSISTANT_ID = os.getenv("VAPI_BOOKING_ASSISTANT_ID", "943a1a0a-1320-42a7-81dc-b98c02b45cb4")
+CALLER_PHONE_ID = os.getenv("VAPI_PHONE_NUMBER_ID", "35ca1dab-04b2-4e2c-9358-aa292536d6f3")
+
+
+def _e164_it(n: Optional[str]) -> Optional[str]:
+    d = re.sub(r"\D", "", n or "")
+    if not d:
+        return None
+    if d.startswith("39") and len(d) >= 11:
+        return "+" + d
+    if d.startswith("0"):          # geografico italiano (es. 02...) senza prefisso paese
+        return "+39" + d
+    if len(d) in (9, 10) and d.startswith("3"):
+        return "+39" + d
+    return "+" + d
+
+
+@router.post("/prenota", dependencies=[Depends(check_auth)])
+async def prenota(request: Request, db: asyncpg.Pool = Depends(get_db)):
+    params, tc = await _in(request)
+    ristorante = str(params.get("ristorante") or "").strip() or "il ristorante"
+    persone = str(params.get("persone") or "").strip()
+    quando = str(params.get("quando") or "").strip()
+    a_nome = str(params.get("a_nome") or "Ilan").strip()
+    numero = params.get("numero")
+    place_id = params.get("place_id")
+
+    key = os.getenv("VAPI_API_KEY", "")
+    if not key:
+        return _out({"avviata": False, "messaggio": "Le chiamate in uscita non sono ancora configurate."}, tc)
+    if not persone or not quando:
+        return _out({"avviata": False, "messaggio": "Per quante persone e per quando?"}, tc)
+
+    rest_num = None
+    if numero:
+        rest_num = _e164_it(str(numero))
+    elif place_id:
+        gk = os.getenv("GOOGLE_MAPS_API_KEY", "")
+        if gk:
+            try:
+                d = await _place_details(gk, str(place_id))
+                tel = d.get("international_phone_number") or d.get("formatted_phone_number")
+                rest_num = _e164_it(tel) if tel else None
+                if ristorante == "il ristorante" and d.get("name"):
+                    ristorante = d["name"]
+            except Exception:
+                pass
+    if not rest_num:
+        return _out({"avviata": False, "messaggio": "Non ho il numero del ristorante, riprova a cercarlo."}, tc)
+
+    body = {
+        "assistantId": BOOKING_ASSISTANT_ID,
+        "phoneNumberId": CALLER_PHONE_ID,
+        "customer": {"number": rest_num},
+        "assistantOverrides": {"variableValues": {
+            "ristorante": ristorante, "persone": persone, "quando": quando, "a_nome": a_nome,
+        }},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as cli:
+            r = await cli.post(VAPI_CALL_URL,
+                               headers={"Authorization": "Bearer " + key,
+                                        "Content-Type": "application/json"},
+                               json=body)
+        ok = r.status_code in (200, 201)
+    except Exception:
+        ok = False
+    return _out({"avviata": ok, "ristorante": ristorante,
+                 "messaggio": (f"Sto chiamando {ristorante}, ti faccio sapere com'e' andata."
+                               if ok else "Non sono riuscito a far partire la chiamata.")}, tc)
+
+
+# ----------------------------------------------------------------------------
 # Webhook eventi Vapi: a fine chiamata riscrive un riassunto nella memoria
 # condivisa, cosi' Telegram e' allineato. (server.url dell'assistente Paolo)
 # ----------------------------------------------------------------------------
