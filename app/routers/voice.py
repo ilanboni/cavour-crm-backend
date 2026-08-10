@@ -12,15 +12,54 @@ all'agente (finche' immobili.esclusiva non e' popolato). immobili_esterni
 
 Stack DB: asyncpg (pool Postgres), come il resto del backend.
 """
-from fastapi import APIRouter, Header, HTTPException, Depends
+from fastapi import APIRouter, Header, HTTPException, Depends, Request
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timedelta
 import asyncpg
+import json
 
 from app.config import get_db, settings
 
 router = APIRouter(prefix="/api/voice", tags=["voice"])
+
+
+# ----------------------------------------------------------------------------
+# Protocollo Vapi: gli endpoint accettano sia il formato "piatto" (test/REST)
+# sia l'envelope Vapi {message:{toolCalls:[{id, function:{name, arguments}}]}}
+# e rispondono di conseguenza. Se e' Vapi, la risposta va incapsulata in
+# {results:[{toolCallId, result:"<stringa>"}]}.
+# ----------------------------------------------------------------------------
+async def _in(request: Request):
+    """Ritorna (params: dict, tool_call_id | None)."""
+    try:
+        raw = await request.json()
+    except Exception:
+        return {}, None
+    if isinstance(raw, dict) and isinstance(raw.get("message"), dict):
+        msg = raw["message"]
+        tcs = msg.get("toolCalls") or msg.get("toolCallList") or []
+        if tcs:
+            tc = tcs[0]
+            tcid = tc.get("id") or tc.get("toolCallId")
+            fn = tc.get("function") or {}
+            args = fn.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+            return (args or {}), tcid
+    return (raw if isinstance(raw, dict) else {}), None
+
+
+def _out(result, tool_call_id):
+    if tool_call_id:
+        return {"results": [{
+            "toolCallId": tool_call_id,
+            "result": json.dumps(result, ensure_ascii=False),
+        }]}
+    return result
 
 # --- Whitelist mandato confermata (immobili pubblicati sito+vetrina) ---
 VOICE_WHITELIST_IDS = [6, 7, 8, 9, 10, 11, 12, 13, 14]
@@ -122,8 +161,9 @@ class LookupIn(BaseModel):
 
 
 @router.post("/lookup-cliente", dependencies=[Depends(check_auth)])
-async def lookup_cliente(body: LookupIn, db: asyncpg.Pool = Depends(get_db)):
-    tel = body.telefono
+async def lookup_cliente(request: Request, db: asyncpg.Pool = Depends(get_db)):
+    params, _tcid = await _in(request)
+    tel = str(params.get("telefono") or "")
     async with db.acquire() as conn:
         # Match robusto: ultime 9 cifre, ignorando +, spazi, prefissi.
         cli = await conn.fetchrow(
@@ -154,7 +194,7 @@ async def lookup_cliente(body: LookupIn, db: asyncpg.Pool = Depends(get_db)):
             r = dict(ric) if ric else {}
             import re
             zone = [z.strip() for z in re.split(r"[,/;]", r.get("zona") or "") if z.strip()]
-            return {
+            return _out({
                 "trovato": True,
                 "tipo": "cliente",
                 "cliente_id": cli["id"],
@@ -165,7 +205,7 @@ async def lookup_cliente(body: LookupIn, db: asyncpg.Pool = Depends(get_db)):
                 "mq_min": r.get("mq_minimi"),
                 "mq_max": r.get("mq_massimi"),
                 "note_sintetiche": (cli["note"] or "")[:200] or None,
-            }
+            }, _tcid)
 
         # Memoria unificata: cerca tra i lead di Paolo (WhatsApp/portali)
         ld = await conn.fetchrow(
@@ -181,16 +221,16 @@ async def lookup_cliente(body: LookupIn, db: asyncpg.Pool = Depends(get_db)):
         )
         if ld:
             nome = " ".join(x for x in [ld["nome"], ld["cognome"]] if x) or None
-            return {
+            return _out({
                 "trovato": True,
                 "tipo": "lead",
                 "cliente_id": None,
                 "lead_id": str(ld["id"]),
                 "nome": nome,
                 "note_sintetiche": (ld["info_chiave"] or "")[:200] or None,
-            }
+            }, _tcid)
 
-    return {"trovato": False}
+    return _out({"trovato": False}, _tcid)
 
 
 # ----------------------------------------------------------------------------
@@ -202,15 +242,17 @@ class ImmobileIn(BaseModel):
 
 
 @router.post("/immobile", dependencies=[Depends(check_auth)])
-async def immobile(body: ImmobileIn, db: asyncpg.Pool = Depends(get_db)):
+async def immobile(request: Request, db: asyncpg.Pool = Depends(get_db)):
+    params, _tcid = await _in(request)
+    body = ImmobileIn(**{k: params.get(k) for k in ("id", "indirizzo") if k in params})
     async with db.acquire() as conn:
         if body.id is not None:
             if body.id not in VOICE_WHITELIST_IDS:
-                return {"trovato": False}
+                return _out({"trovato": False}, _tcid)
             row = await conn.fetchrow(
                 "SELECT * FROM public.immobili WHERE id = $1 AND attivo", body.id
             )
-            return _scheda_immobile(dict(row)) if row else {"trovato": False}
+            return _out(_scheda_immobile(dict(row)) if row else {"trovato": False}, _tcid)
 
         if body.indirizzo:
             row = await conn.fetchrow(
@@ -221,9 +263,9 @@ async def immobile(body: ImmobileIn, db: asyncpg.Pool = Depends(get_db)):
                 """,
                 VOICE_WHITELIST_IDS, f"%{body.indirizzo}%",
             )
-            return _scheda_immobile(dict(row)) if row else {"trovato": False}
+            return _out(_scheda_immobile(dict(row)) if row else {"trovato": False}, _tcid)
 
-    raise HTTPException(status_code=400, detail="Serve id o indirizzo")
+    return _out({"trovato": False, "messaggio": "Serve id o indirizzo"}, _tcid)
 
 
 # ----------------------------------------------------------------------------
@@ -237,7 +279,10 @@ class ProposteIn(BaseModel):
 
 
 @router.post("/proposte", dependencies=[Depends(check_auth)])
-async def proposte(body: ProposteIn, db: asyncpg.Pool = Depends(get_db)):
+async def proposte(request: Request, db: asyncpg.Pool = Depends(get_db)):
+    params, _tcid = await _in(request)
+    body = ProposteIn(**{k: params.get(k) for k in
+                         ("zone", "budget_max", "mq_min", "tipo_contratto") if k in params})
     tipo = (body.tipo_contratto or "vendita").lower()
     async with db.acquire() as conn:
         rows = await conn.fetch(
@@ -299,13 +344,13 @@ async def proposte(body: ProposteIn, db: asyncpg.Pool = Depends(get_db)):
         if len(scelti) >= 3:
             break
 
-    return {"risultati": [{
+    return _out({"risultati": [{
         "id": r["id"],
         "indirizzo": r.get("indirizzo"),
         "zona": r.get("zona"),
         "mq": r.get("mq"),
         "prezzo_parlato": _prezzo_parlato(r),
-    } for r in scelti[:3]]}
+    } for r in scelti[:3]]}, _tcid)
 
 
 # ----------------------------------------------------------------------------
@@ -321,25 +366,36 @@ class AppuntamentoIn(BaseModel):
 
 
 @router.post("/appuntamento", dependencies=[Depends(check_auth)])
-async def appuntamento(body: AppuntamentoIn, db: asyncpg.Pool = Depends(get_db)):
+async def appuntamento(request: Request, db: asyncpg.Pool = Depends(get_db)):
+    params, _tcid = await _in(request)
+    try:
+        body = AppuntamentoIn(**{k: params.get(k) for k in
+            ("cliente_id", "id_immobile", "codice_immobile", "quando", "telefono", "nome")
+            if k in params})
+    except Exception:
+        return _out({"confermato": False, "motivo": "dati_incompleti",
+                     "messaggio": "Mi serve l'immobile e giorno e ora della visita."}, _tcid)
+
     imm_id = body.id_immobile or body.codice_immobile
     if not imm_id or imm_id not in VOICE_WHITELIST_IDS:
-        raise HTTPException(status_code=400, detail="Immobile non valido")
+        return _out({"confermato": False, "motivo": "immobile_non_valido",
+                     "messaggio": "Non ho quell'immobile tra quelli disponibili."}, _tcid)
 
     quando = body.quando
     if quando.tzinfo is not None:
         quando = quando.replace(tzinfo=None)
 
     if not (ORA_APERTURA <= quando.hour < ORA_CHIUSURA):
-        return {"confermato": False, "motivo": "fuori_orario",
-                "messaggio": "Le visite si fissano tra le 9 e le 20."}
+        return _out({"confermato": False, "motivo": "fuori_orario",
+                     "messaggio": "Le visite si fissano tra le 9 e le 20."}, _tcid)
 
     async with db.acquire() as conn:
         cliente_id = body.cliente_id
         if not cliente_id and body.telefono:
             cliente_id = await _ensure_cliente(conn, body.telefono, body.nome)
         if not cliente_id:
-            raise HTTPException(status_code=400, detail="Serve cliente_id o telefono")
+            return _out({"confermato": False, "motivo": "serve_contatto",
+                         "messaggio": "Mi lascia un recapito per fissare la visita?"}, _tcid)
 
         ini = quando - timedelta(minutes=SLOT_MINUTI)
         fin = quando + timedelta(minutes=SLOT_MINUTI)
@@ -352,8 +408,8 @@ async def appuntamento(body: AppuntamentoIn, db: asyncpg.Pool = Depends(get_db))
             imm_id, ini, fin,
         )
         if occupato:
-            return {"confermato": False, "motivo": "slot_occupato",
-                    "messaggio": "Quell'orario e' gia' occupato, ne propongo un altro."}
+            return _out({"confermato": False, "motivo": "slot_occupato",
+                         "messaggio": "Quell'orario e' gia' occupato, ne propongo un altro."}, _tcid)
 
         appt_id = await conn.fetchval(
             """
@@ -365,11 +421,11 @@ async def appuntamento(body: AppuntamentoIn, db: asyncpg.Pool = Depends(get_db))
             cliente_id, imm_id, quando,
         )
 
-    return {
+    return _out({
         "confermato": True,
         "appuntamento_id": appt_id,
         "quando_parlato": _data_parlata(quando),
-    }
+    }, _tcid)
 
 
 async def _ensure_cliente(conn, telefono: str, nome: Optional[str]) -> Optional[int]:
@@ -431,11 +487,18 @@ class LeadIn(BaseModel):
 
 
 @router.post("/lead", dependencies=[Depends(check_auth)])
-async def lead(body: LeadIn, db: asyncpg.Pool = Depends(get_db)):
+async def lead(request: Request, db: asyncpg.Pool = Depends(get_db)):
+    params, _tcid = await _in(request)
+    try:
+        body = LeadIn(**{k: params.get(k) for k in
+            ("telefono", "nome", "zone", "budget_max", "tipo_contratto", "note")
+            if k in params})
+    except Exception:
+        return _out({"salvato": False, "messaggio": "Mi lascia un numero di telefono?"}, _tcid)
     async with db.acquire() as conn:
         cliente_id = await _ensure_cliente(conn, body.telefono, body.nome)
         if not cliente_id:
-            raise HTTPException(status_code=500, detail="Creazione cliente fallita")
+            return _out({"salvato": False, "messaggio": "Non sono riuscito a salvare, la faccio richiamare."}, _tcid)
         zona = ", ".join(body.zone) if body.zone else None
         ric_id = await conn.fetchval(
             """
@@ -450,4 +513,4 @@ async def lead(body: LeadIn, db: asyncpg.Pool = Depends(get_db)):
             zona,
             body.note,
         )
-    return {"cliente_id": cliente_id, "richiesta_id": ric_id}
+    return _out({"salvato": True, "cliente_id": cliente_id, "richiesta_id": ric_id}, _tcid)
