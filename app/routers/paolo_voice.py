@@ -18,9 +18,11 @@ Protocollo Vapi: riusa _in/_out da app.routers.voice.
 from fastapi import APIRouter, Header, HTTPException, Depends, Request
 from typing import Optional
 from datetime import datetime, timedelta
+import os
 import json
 import re
 import asyncpg
+import httpx
 
 try:
     from zoneinfo import ZoneInfo
@@ -252,6 +254,80 @@ async def contesto(request: Request, db: asyncpg.Pool = Depends(get_db)):
         f"{m.get('role','?')}: {str(m.get('content',''))[:120]}" for m in ultimi
     ) or "Nessuno scambio recente."
     return _out({"recap": recap, "n_messaggi": len(msgs)}, tc)
+
+
+# ----------------------------------------------------------------------------
+# trova (posti/ristoranti/info via Google Places) — skill "vero segretario"
+# ----------------------------------------------------------------------------
+@router.post("/trova", dependencies=[Depends(check_auth)])
+async def trova(request: Request, db: asyncpg.Pool = Depends(get_db)):
+    params, tc = await _in(request)
+    cosa = str(params.get("cosa") or params.get("query") or "").strip()
+    dove = str(params.get("dove") or "Milano").strip()
+    if not cosa:
+        return _out({"trovato": False, "messaggio": "Cosa cerco?"}, tc)
+    key = os.getenv("GOOGLE_MAPS_API_KEY", "")
+    if not key:
+        return _out({"trovato": False,
+                     "messaggio": "La ricerca posti non e' ancora attiva."}, tc)
+    q = f"{cosa} a {dove}"
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as cli:
+            r = await cli.get(
+                "https://maps.googleapis.com/maps/api/place/textsearch/json",
+                params={"query": q, "language": "it", "region": "it", "key": key},
+            )
+            data = r.json()
+    except Exception:
+        return _out({"trovato": False,
+                     "messaggio": "Non riesco a cercare adesso, riprova tra poco."}, tc)
+    posti = []
+    for p in (data.get("results") or [])[:3]:
+        oh = p.get("opening_hours") or {}
+        posti.append({
+            "nome": p.get("name"),
+            "indirizzo": p.get("formatted_address"),
+            "rating": p.get("rating"),
+            "aperto_ora": oh.get("open_now"),
+            "place_id": p.get("place_id"),
+        })
+    if not posti:
+        return _out({"trovato": False, "messaggio": f"Non trovo nulla per '{cosa}' a {dove}."}, tc)
+    return _out({"trovato": True, "posti": posti,
+                 "messaggio": f"Ho trovato {len(posti)} opzioni."}, tc)
+
+
+async def _place_details(key: str, place_id: str) -> dict:
+    """Numero e orari di un posto (per chiamarlo / prenotare in futuro)."""
+    async with httpx.AsyncClient(timeout=8.0) as cli:
+        r = await cli.get(
+            "https://maps.googleapis.com/maps/api/place/details/json",
+            params={"place_id": place_id, "language": "it",
+                    "fields": "name,formatted_phone_number,international_phone_number,opening_hours,formatted_address",
+                    "key": key},
+        )
+        return (r.json() or {}).get("result", {}) or {}
+
+
+@router.post("/contatto-posto", dependencies=[Depends(check_auth)])
+async def contatto_posto(request: Request, db: asyncpg.Pool = Depends(get_db)):
+    """Dettagli di contatto di un posto (numero) — base per la prenotazione telefonica."""
+    params, tc = await _in(request)
+    place_id = str(params.get("place_id") or "").strip()
+    key = os.getenv("GOOGLE_MAPS_API_KEY", "")
+    if not place_id or not key:
+        return _out({"trovato": False, "messaggio": "Mi serve il posto preciso."}, tc)
+    try:
+        d = await _place_details(key, place_id)
+    except Exception:
+        return _out({"trovato": False, "messaggio": "Non riesco a recuperarlo ora."}, tc)
+    tel = d.get("formatted_phone_number") or d.get("international_phone_number")
+    return _out({
+        "trovato": bool(tel),
+        "nome": d.get("name"),
+        "telefono": tel,
+        "indirizzo": d.get("formatted_address"),
+    }, tc)
 
 
 # ----------------------------------------------------------------------------
