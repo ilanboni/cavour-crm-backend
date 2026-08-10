@@ -35,7 +35,7 @@ from app.routers.voice import _in, _out, check_auth
 
 router = APIRouter(prefix="/api/paolo", tags=["paolo-voce"])
 
-SESSION_KEY = "session_ilan_paolo"
+SESSION_KEY = "session_ilan_paolo"  # memoria unica di Paolo, condivisa tra voce personale e Telegram
 MAX_MEMORIA = 30
 
 GIORNI = ["lunedi", "martedi", "mercoledi", "giovedi", "venerdi", "sabato", "domenica"]
