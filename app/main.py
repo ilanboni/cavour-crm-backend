@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.config import get_db, close_db
-from app.routers import clienti, immobili, scouting, matching, richieste, coach, voice
+from app.routers import clienti, immobili, scouting, matching, richieste, coach, voice, paolo_voice
 from app.routers.operativo import comm_router, appt_router, doc_router
 
 @asynccontextmanager
@@ -37,6 +37,7 @@ app.include_router(appt_router)
 app.include_router(doc_router)
 app.include_router(coach.router)
 app.include_router(voice.router)
+app.include_router(paolo_voice.router)
 
 @app.get("/")
 async def root():
