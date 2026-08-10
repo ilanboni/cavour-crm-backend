@@ -441,6 +441,7 @@ async def chiama(request: Request, db: asyncpg.Pool = Depends(get_db)):
 
     rest_num = None
     nome_dest = chi or "il contatto"
+    relazione = ""
     if numero:
         rest_num = _e164_it(str(numero))
     elif place_id:
@@ -462,6 +463,7 @@ async def chiama(request: Request, db: asyncpg.Pool = Depends(get_db)):
                 if any(k and (dl == k or (len(k) >= 4 and k in dl)) for k in chiavi):
                     rest_num = _e164_it(c.get("telefono"))
                     nome_dest = c.get("nome") or chi
+                    relazione = "famiglia"
                     break
             if not rest_num:
                 row = await conn.fetchrow(
@@ -477,7 +479,9 @@ async def chiama(request: Request, db: asyncpg.Pool = Depends(get_db)):
         "assistantId": ERRAND_ASSISTANT_ID,
         "phoneNumberId": CALLER_PHONE_ID,
         "customer": {"number": rest_num},
-        "assistantOverrides": {"variableValues": {"chi": nome_dest, "scopo": scopo, "a_nome": a_nome}},
+        "assistantOverrides": {"variableValues": {
+            "chi": nome_dest, "scopo": scopo, "a_nome": a_nome, "relazione": relazione,
+        }},
     }
     try:
         async with httpx.AsyncClient(timeout=15.0) as cli:
