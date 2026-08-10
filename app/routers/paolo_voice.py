@@ -407,6 +407,141 @@ async def prenota(request: Request, db: asyncpg.Pool = Depends(get_db)):
 
 
 # ----------------------------------------------------------------------------
+# chiama (Paolo telefona a chiunque per una commissione, via Vapi outbound)
+# ----------------------------------------------------------------------------
+ERRAND_ASSISTANT_ID = os.getenv("VAPI_ERRAND_ASSISTANT_ID", "")
+
+
+async def _rubrica(conn) -> list:
+    val = await conn.fetchval(
+        "SELECT value FROM public.system_config WHERE key = 'rubrica_personale_ilan'")
+    if not val:
+        return []
+    try:
+        d = json.loads(val)
+        return d if isinstance(d, list) else []
+    except Exception:
+        return []
+
+
+@router.post("/chiama", dependencies=[Depends(check_auth)])
+async def chiama(request: Request, db: asyncpg.Pool = Depends(get_db)):
+    params, tc = await _in(request)
+    scopo = str(params.get("scopo") or params.get("motivo") or "").strip()
+    a_nome = str(params.get("a_nome") or "Ilan").strip()
+    chi = str(params.get("chi") or params.get("nome") or "").strip()
+    numero = params.get("numero")
+    place_id = params.get("place_id")
+
+    key = os.getenv("VAPI_API_KEY", "")
+    if not key or not ERRAND_ASSISTANT_ID:
+        return _out({"avviata": False, "messaggio": "Le chiamate in uscita non sono ancora configurate."}, tc)
+    if not scopo:
+        return _out({"avviata": False, "messaggio": "Per dirgli cosa devo chiamare?"}, tc)
+
+    rest_num = None
+    nome_dest = chi or "il contatto"
+    if numero:
+        rest_num = _e164_it(str(numero))
+    elif place_id:
+        gk = os.getenv("GOOGLE_MAPS_API_KEY", "")
+        if gk:
+            try:
+                d = await _place_details(gk, str(place_id))
+                tel = d.get("international_phone_number") or d.get("formatted_phone_number")
+                rest_num = _e164_it(tel) if tel else None
+                nome_dest = d.get("name") or nome_dest
+            except Exception:
+                pass
+    elif chi:
+        dl = chi.lower()
+        async with db.acquire() as conn:
+            for c in await _rubrica(conn):
+                chiavi = [str(x).lower() for x in (c.get("relazioni") or [])]
+                chiavi.append(str(c.get("nome", "")).lower())
+                if any(k and (dl == k or (len(k) >= 4 and k in dl)) for k in chiavi):
+                    rest_num = _e164_it(c.get("telefono"))
+                    nome_dest = c.get("nome") or chi
+                    break
+            if not rest_num:
+                row = await conn.fetchrow(
+                    "SELECT nome, cognome, telefono FROM public.clienti WHERE attivo AND telefono IS NOT NULL "
+                    "AND (nome ILIKE $1 OR cognome ILIKE $1) LIMIT 1", f"%{chi}%")
+                if row:
+                    rest_num = _e164_it(row["telefono"])
+                    nome_dest = " ".join(x for x in [row["nome"], row["cognome"]] if x) or chi
+    if not rest_num:
+        return _out({"avviata": False, "messaggio": f"Non ho il numero di {nome_dest}."}, tc)
+
+    body = {
+        "assistantId": ERRAND_ASSISTANT_ID,
+        "phoneNumberId": CALLER_PHONE_ID,
+        "customer": {"number": rest_num},
+        "assistantOverrides": {"variableValues": {"chi": nome_dest, "scopo": scopo, "a_nome": a_nome}},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as cli:
+            r = await cli.post(VAPI_CALL_URL,
+                               headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
+                               json=body)
+        ok = r.status_code in (200, 201)
+    except Exception:
+        ok = False
+    return _out({"avviata": ok, "chi": nome_dest,
+                 "messaggio": (f"Sto chiamando {nome_dest}, ti faccio sapere."
+                               if ok else "Non sono riuscito a far partire la chiamata.")}, tc)
+
+
+# ----------------------------------------------------------------------------
+# calcola (provvigione / rata mutuo) — deterministico
+# ----------------------------------------------------------------------------
+def _num_it(x) -> str:
+    try:
+        return f"{int(round(float(x))):,}".replace(",", ".")
+    except Exception:
+        return str(x)
+
+
+@router.post("/calcola", dependencies=[Depends(check_auth)])
+async def calcola(request: Request, db: asyncpg.Pool = Depends(get_db)):
+    params, tc = await _in(request)
+    tipo = str(params.get("tipo") or "").lower()
+
+    def f(*keys, default=0.0):
+        for k in keys:
+            v = params.get(k)
+            if v not in (None, ""):
+                try:
+                    return float(str(v).replace(",", "."))
+                except Exception:
+                    pass
+        return default
+
+    if "provv" in tipo:
+        prezzo = f("prezzo", "importo")
+        perc = f("percentuale", "perc", default=3.0)
+        if prezzo <= 0:
+            return _out({"messaggio": "Su quale prezzo?"}, tc)
+        imp = prezzo * perc / 100
+        return _out({"importo": round(imp), "con_iva": round(imp * 1.22),
+                     "messaggio": f"Provvigione del {perc:g}% su {_num_it(prezzo)} euro: {_num_it(imp)} euro, {_num_it(imp*1.22)} con IVA."}, tc)
+
+    if "mutuo" in tipo or "rata" in tipo:
+        cap = f("importo", "capitale", "prezzo")
+        tasso_a = f("tasso", "tasso_annuo")
+        anni = f("anni", "durata")
+        if cap <= 0 or anni <= 0:
+            return _out({"messaggio": "Mi servono importo, tasso e anni."}, tc)
+        i = tasso_a / 100 / 12
+        n = int(anni * 12)
+        rata = cap * i / (1 - (1 + i) ** (-n)) if i > 0 else cap / n
+        return _out({"rata": round(rata),
+                     "messaggio": f"Rata stimata: circa {_num_it(rata)} euro al mese per {int(anni)} anni."}, tc)
+
+    return _out({"messaggio": "Posso calcolare la provvigione o la rata di un mutuo. Quale ti serve?"}, tc)
+
+
+# ----------------------------------------------------------------------------
 # Webhook eventi Vapi: a fine chiamata riscrive un riassunto nella memoria
 # condivisa, cosi' Telegram e' allineato. (server.url dell'assistente Paolo)
 # ----------------------------------------------------------------------------
