@@ -384,24 +384,15 @@ async def prenota(request: Request, db: asyncpg.Pool = Depends(get_db)):
             except Exception:
                 pass
     # Fallback: solo il NOME (es. richiesta da Telegram) -> cerca su Google
+    # (con citta' e poi senza, per trovare posti fuori Milano)
     if not rest_num and ristorante and ristorante != "il ristorante":
         gk = os.getenv("GOOGLE_MAPS_API_KEY", "")
         if gk:
-            try:
-                async with httpx.AsyncClient(timeout=8.0) as cli:
-                    rr = await cli.get(
-                        "https://maps.googleapis.com/maps/api/place/textsearch/json",
-                        params={"query": f"{ristorante} {dove}", "language": "it", "region": "it", "key": gk},
-                    )
-                    results = (rr.json() or {}).get("results") or []
-                if results:
-                    d = await _place_details(gk, results[0].get("place_id"))
-                    tel = d.get("international_phone_number") or d.get("formatted_phone_number")
-                    rest_num = _e164_it(tel) if tel else None
-                    if d.get("name"):
-                        ristorante = d["name"]
-            except Exception:
-                pass
+            c = await _trova_numero(gk, ristorante, dove)
+            if c:
+                rest_num = _e164_it(c["numero"])
+                if c.get("ristorante"):
+                    ristorante = c["ristorante"]
     if not rest_num:
         return _out({"avviata": False, "messaggio": "Non ho trovato il numero del ristorante."}, tc)
 
@@ -627,21 +618,35 @@ async def _num_da_place(gk: str, place_id: str, nome_default: str = "") -> Optio
     return {"ristorante": d.get("name") or nome_default, "numero": num}
 
 
-async def _candidati_da_nomi(gk: str, nomi: list, dove: str) -> list:
-    out = []
-    for nome in nomi:
+async def _trova_numero(gk: str, nome: str, dove: str) -> Optional[dict]:
+    """Cerca il numero di un ristorante: prima con la citta', poi (fallback) col
+    solo nome, cosi' trova posti fuori Milano (es. Forte dei Marmi)."""
+    queries = [f"{nome} {dove}".strip(), nome.strip()]
+    visti = set()
+    for q in queries:
+        if not q or q in visti:
+            continue
+        visti.add(q)
         try:
             async with httpx.AsyncClient(timeout=8.0) as cli:
                 rr = await cli.get(
                     "https://maps.googleapis.com/maps/api/place/textsearch/json",
-                    params={"query": f"{nome} {dove}", "language": "it", "region": "it", "key": gk},
+                    params={"query": q, "language": "it", "region": "it", "key": gk},
                 )
             results = (rr.json() or {}).get("results") or []
         except Exception:
             results = []
-        if not results:
-            continue
-        c = await _num_da_place(gk, results[0].get("place_id"), nome)
+        if results:
+            c = await _num_da_place(gk, results[0].get("place_id"), nome)
+            if c:
+                return c
+    return None
+
+
+async def _candidati_da_nomi(gk: str, nomi: list, dove: str) -> list:
+    out = []
+    for nome in nomi:
+        c = await _trova_numero(gk, nome, dove)
         if c:
             out.append(c)
     return out
