@@ -778,6 +778,35 @@ async def giro(request: Request, db: asyncpg.Pool = Depends(get_db)):
     }, tc)
 
 
+@router.post("/call-esito", dependencies=[Depends(check_auth)])
+async def call_esito(request: Request, db: asyncpg.Pool = Depends(get_db)):
+    """Ritorna l'esito di una chiamata Vapi (usato dal poller di Paolo, che non
+    ha la VAPI_API_KEY). 'pronto' e' True solo se la chiamata e' terminata."""
+    params, tc = await _in(request)
+    call_id = str(params.get("call_id") or "").strip()
+    key = os.getenv("VAPI_API_KEY", "")
+    if not call_id or not key:
+        return _out({"pronto": False}, tc)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as cli:
+            r = await cli.get("https://api.vapi.ai/call/" + call_id,
+                              headers={"Authorization": "Bearer " + key})
+        if r.status_code != 200:
+            return _out({"pronto": False}, tc)
+        call = r.json() or {}
+    except Exception:
+        return _out({"pronto": False}, tc)
+    if call.get("status") != "ended":
+        return _out({"pronto": False}, tc)
+    sd = (call.get("analysis") or {}).get("structuredData") or {}
+    if sd:
+        return _out({"pronto": True, "disponibile": bool(sd.get("disponibile")),
+                     "orario_proposto": str(sd.get("orario_proposto") or ""),
+                     "note": str(sd.get("note") or "")}, tc)
+    return _out({"pronto": True, "disponibile": False, "orario_proposto": "",
+                 "note": str(call.get("endedReason") or "")}, tc)
+
+
 @router.post("/prenota-giro", dependencies=[Depends(check_auth)])
 async def prenota_giro(request: Request, db: asyncpg.Pool = Depends(get_db)):
     """Fase B — B2: dopo il report, Ilan sceglie 'prenota il N' e Paolo prenota
