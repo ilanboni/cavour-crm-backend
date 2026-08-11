@@ -424,6 +424,7 @@ async def prenota(request: Request, db: asyncpg.Pool = Depends(get_db)):
         }},
         "metadata": {"tipo": tipo, "luogo": luogo, "oggetto": oggetto, "quando_label": quando},
     }
+    call_id = None
     try:
         async with httpx.AsyncClient(timeout=15.0) as cli:
             r = await cli.post(VAPI_CALL_URL,
@@ -431,8 +432,19 @@ async def prenota(request: Request, db: asyncpg.Pool = Depends(get_db)):
                                         "Content-Type": "application/json"},
                                json=body)
         ok = r.status_code in (200, 201)
+        if ok:
+            call_id = (r.json() or {}).get("id")
     except Exception:
         ok = False
+    if ok and call_id:
+        try:
+            async with db.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO public.prenotazioni_vocali (call_id, tipo, luogo, oggetto, quando_label, stato) "
+                    "VALUES ($1,$2,$3,$4,$5,'in_corso')",
+                    call_id, tipo, luogo, oggetto, quando)
+        except Exception:
+            pass
     return _out({"avviata": ok, "luogo": luogo, "ristorante": luogo,
                  "messaggio": (f"Sto chiamando {luogo} per prenotare {cosa}, {quando}. Ti faccio sapere com'e' andata."
                                if ok else "Non sono riuscito a far partire la chiamata.")}, tc)
@@ -799,12 +811,14 @@ async def call_esito(request: Request, db: asyncpg.Pool = Depends(get_db)):
     if call.get("status") != "ended":
         return _out({"pronto": False}, tc)
     sd = (call.get("analysis") or {}).get("structuredData") or {}
+    ended = str(call.get("endedReason") or "")
     if sd:
         return _out({"pronto": True, "disponibile": bool(sd.get("disponibile")),
                      "orario_proposto": str(sd.get("orario_proposto") or ""),
-                     "note": str(sd.get("note") or "")}, tc)
+                     "note": str(sd.get("note") or ""),
+                     "structured": sd, "ended_reason": ended}, tc)
     return _out({"pronto": True, "disponibile": False, "orario_proposto": "",
-                 "note": str(call.get("endedReason") or "")}, tc)
+                 "note": ended, "structured": {}, "ended_reason": ended}, tc)
 
 
 @router.post("/prenota-giro", dependencies=[Depends(check_auth)])
@@ -853,6 +867,7 @@ async def prenota_giro(request: Request, db: asyncpg.Pool = Depends(get_db)):
         "metadata": {"tipo": "ristorante", "luogo": scelto["ristorante"],
                      "oggetto": oggetto, "quando_label": quando},
     }
+    call_id = None
     try:
         async with httpx.AsyncClient(timeout=15.0) as cli:
             r = await cli.post(VAPI_CALL_URL,
@@ -860,8 +875,19 @@ async def prenota_giro(request: Request, db: asyncpg.Pool = Depends(get_db)):
                                         "Content-Type": "application/json"},
                                json=body)
         ok = r.status_code in (200, 201)
+        if ok:
+            call_id = (r.json() or {}).get("id")
     except Exception:
         ok = False
+    if ok and call_id:
+        try:
+            async with db.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO public.prenotazioni_vocali (call_id, tipo, luogo, oggetto, quando_label, stato) "
+                    "VALUES ($1,'ristorante',$2,$3,$4,'in_corso')",
+                    call_id, scelto["ristorante"], oggetto, quando)
+        except Exception:
+            pass
     return _out({"avviata": ok, "ristorante": scelto["ristorante"],
                  "messaggio": (f"Sto chiamando {scelto['ristorante']} per prenotare. "
                                f"Ti confermo appena ho finito."
