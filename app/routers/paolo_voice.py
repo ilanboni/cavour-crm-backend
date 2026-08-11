@@ -364,6 +364,10 @@ async def prenota(request: Request, db: asyncpg.Pool = Depends(get_db)):
     dove = str(params.get("dove") or "Milano").strip()
     numero = params.get("numero")
     place_id = params.get("place_id")
+    try:
+        programmata_id = int(params.get("programmata_id")) if params.get("programmata_id") else None
+    except Exception:
+        programmata_id = None
 
     key = os.getenv("VAPI_API_KEY", "")
     if not key:
@@ -440,9 +444,9 @@ async def prenota(request: Request, db: asyncpg.Pool = Depends(get_db)):
         try:
             async with db.acquire() as conn:
                 await conn.execute(
-                    "INSERT INTO public.prenotazioni_vocali (call_id, tipo, luogo, oggetto, quando_label, stato) "
-                    "VALUES ($1,$2,$3,$4,$5,'in_corso')",
-                    call_id, tipo, luogo, oggetto, quando)
+                    "INSERT INTO public.prenotazioni_vocali (call_id, tipo, luogo, oggetto, quando_label, stato, programmata_id) "
+                    "VALUES ($1,$2,$3,$4,$5,'in_corso',$6)",
+                    call_id, tipo, luogo, oggetto, quando, programmata_id)
         except Exception:
             pass
     return _out({"avviata": ok, "luogo": luogo, "ristorante": luogo,
@@ -819,6 +823,74 @@ async def call_esito(request: Request, db: asyncpg.Pool = Depends(get_db)):
                      "structured": sd, "ended_reason": ended}, tc)
     return _out({"pronto": True, "disponibile": False, "orario_proposto": "",
                  "note": ended, "structured": {}, "ended_reason": ended}, tc)
+
+
+def _parse_esegui(s: str):
+    """Interpreta l'orario a cui far PARTIRE la chiamata: ISO completo
+    (es. 2026-08-11T23:01) oppure solo orario HH:MM (oggi, o domani se gia' passato)."""
+    s = (s or "").replace("Z", "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None and ROMA:
+            dt = dt.replace(tzinfo=ROMA)
+        return dt
+    except Exception:
+        pass
+    m = re.match(r"^(\d{1,2})[:.](\d{2})$", s)
+    if m:
+        now = datetime.now(ROMA) if ROMA else datetime.now()
+        cand = now.replace(hour=int(m.group(1)), minute=int(m.group(2)),
+                           second=0, microsecond=0)
+        if cand <= now:
+            cand = cand + timedelta(days=1)
+        return cand
+    return None
+
+
+@router.post("/programma-chiamata", dependencies=[Depends(check_auth)])
+async def programma_chiamata(request: Request, db: asyncpg.Pool = Depends(get_db)):
+    """Salva una chiamata (prenotazione o giro) da far partire a un orario futuro.
+    Un job al minuto la esegue quando arriva l'ora."""
+    params, tc = await _in(request)
+    dt = _parse_esegui(str(params.get("esegui_alle") or params.get("quando_chiamare") or ""))
+    if not dt:
+        return _out({"programmata": False, "messaggio": "A che ora devo richiamare?"}, tc)
+    azione = str(params.get("azione") or "prenota").strip().lower()
+    if azione not in ("prenota", "giro"):
+        azione = "prenota"
+    ripeti = bool(params.get("ripeti"))
+    try:
+        max_tentativi = int(params.get("max_tentativi") or (2 if ripeti else 1))
+    except Exception:
+        max_tentativi = 2 if ripeti else 1
+    max_tentativi = max(1, min(max_tentativi, 5))
+    try:
+        intervallo_min = int(params.get("intervallo_min") or 15)
+    except Exception:
+        intervallo_min = 15
+    intervallo_min = max(5, min(intervallo_min, 120))
+    payload = {}
+    for k in ("tipo", "luogo", "quando", "persone", "dove", "cosa", "ristoranti", "a_nome"):
+        v = params.get(k)
+        if v is not None and v != "":
+            payload[k] = v
+    payload.setdefault("a_nome", "Ilan")
+    if not payload.get("luogo") and not payload.get("ristoranti"):
+        return _out({"programmata": False, "messaggio": "Quale posto devo richiamare?"}, tc)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO public.chiamate_programmate "
+            "(esegui_alle, azione, payload, stato, ripeti, intervallo_min, max_tentativi, tentativi) "
+            "VALUES ($1,$2,$3::jsonb,'in_attesa',$4,$5,$6,0)",
+            dt, azione, json.dumps(payload, ensure_ascii=False), ripeti, intervallo_min, max_tentativi)
+    coda = ""
+    if ripeti and max_tentativi > 1:
+        coda = f" Se non risponde nessuno riprovo (fino a {max_tentativi} volte, ogni {intervallo_min} min)."
+    return _out({"programmata": True, "esegui_alle": dt.isoformat(),
+                 "messaggio": (f"Ok, richiamo {payload.get('luogo', 'il posto')} alle "
+                               f"{dt.strftime('%H:%M')} e ti mando l'esito." + coda)}, tc)
 
 
 @router.post("/prenota-giro", dependencies=[Depends(check_auth)])
