@@ -358,6 +358,7 @@ async def prenota(request: Request, db: asyncpg.Pool = Depends(get_db)):
     persone = str(params.get("persone") or "").strip()
     quando = str(params.get("quando") or "").strip()
     a_nome = str(params.get("a_nome") or "Ilan").strip()
+    dove = str(params.get("dove") or "Milano").strip()
     numero = params.get("numero")
     place_id = params.get("place_id")
 
@@ -381,8 +382,27 @@ async def prenota(request: Request, db: asyncpg.Pool = Depends(get_db)):
                     ristorante = d["name"]
             except Exception:
                 pass
+    # Fallback: solo il NOME (es. richiesta da Telegram) -> cerca su Google
+    if not rest_num and ristorante and ristorante != "il ristorante":
+        gk = os.getenv("GOOGLE_MAPS_API_KEY", "")
+        if gk:
+            try:
+                async with httpx.AsyncClient(timeout=8.0) as cli:
+                    rr = await cli.get(
+                        "https://maps.googleapis.com/maps/api/place/textsearch/json",
+                        params={"query": f"{ristorante} {dove}", "language": "it", "region": "it", "key": gk},
+                    )
+                    results = (rr.json() or {}).get("results") or []
+                if results:
+                    d = await _place_details(gk, results[0].get("place_id"))
+                    tel = d.get("international_phone_number") or d.get("formatted_phone_number")
+                    rest_num = _e164_it(tel) if tel else None
+                    if d.get("name"):
+                        ristorante = d["name"]
+            except Exception:
+                pass
     if not rest_num:
-        return _out({"avviata": False, "messaggio": "Non ho il numero del ristorante, riprova a cercarlo."}, tc)
+        return _out({"avviata": False, "messaggio": "Non ho trovato il numero del ristorante."}, tc)
 
     body = {
         "assistantId": BOOKING_ASSISTANT_ID,
