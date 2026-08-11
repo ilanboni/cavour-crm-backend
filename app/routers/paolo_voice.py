@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 import os
 import json
 import re
+import uuid
 import asyncpg
 import httpx
 
@@ -602,3 +603,209 @@ async def vapi_events(request: Request, x_voice_secret: Optional[str] = Header(N
             SESSION_KEY, json.dumps(msgs, ensure_ascii=False),
         )
     return {"ok": True}
+
+
+# ----------------------------------------------------------------------------
+# giro di perlustrazione: Paolo chiama piu' ristoranti per vedere chi ha posto
+# (Fase B). Ogni chiamata usa l'assistente "Perlustrazione" e a fine chiamata
+# il webhook /webhook/vapi-perlustrazione (Flask) aggrega e avvisa Ilan.
+# ----------------------------------------------------------------------------
+PERLUSTRA_ASSISTANT_ID = os.getenv("VAPI_PERLUSTRA_ASSISTANT_ID",
+                                   "0405a598-3439-439c-9b9b-0e51d53e08b1")
+GIRO_MAX = 5
+
+
+async def _num_da_place(gk: str, place_id: str, nome_default: str = "") -> Optional[dict]:
+    try:
+        d = await _place_details(gk, place_id)
+    except Exception:
+        return None
+    tel = d.get("international_phone_number") or d.get("formatted_phone_number")
+    num = _e164_it(tel) if tel else None
+    if not num:
+        return None
+    return {"ristorante": d.get("name") or nome_default, "numero": num}
+
+
+async def _candidati_da_nomi(gk: str, nomi: list, dove: str) -> list:
+    out = []
+    for nome in nomi:
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as cli:
+                rr = await cli.get(
+                    "https://maps.googleapis.com/maps/api/place/textsearch/json",
+                    params={"query": f"{nome} {dove}", "language": "it", "region": "it", "key": gk},
+                )
+            results = (rr.json() or {}).get("results") or []
+        except Exception:
+            results = []
+        if not results:
+            continue
+        c = await _num_da_place(gk, results[0].get("place_id"), nome)
+        if c:
+            out.append(c)
+    return out
+
+
+async def _candidati_da_ricerca(gk: str, cosa: str, dove: str, quanti: int) -> list:
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as cli:
+            rr = await cli.get(
+                "https://maps.googleapis.com/maps/api/place/textsearch/json",
+                params={"query": f"{cosa} a {dove}", "language": "it", "region": "it", "key": gk},
+            )
+        results = (rr.json() or {}).get("results") or []
+    except Exception:
+        results = []
+    out = []
+    for p in results:
+        if len(out) >= quanti:
+            break
+        c = await _num_da_place(gk, p.get("place_id"), p.get("name") or "")
+        if c:
+            out.append(c)
+    return out
+
+
+@router.post("/giro", dependencies=[Depends(check_auth)])
+async def giro(request: Request, db: asyncpg.Pool = Depends(get_db)):
+    params, tc = await _in(request)
+    persone = str(params.get("persone") or "").strip()
+    quando = str(params.get("quando") or "").strip()
+    dove = str(params.get("dove") or "Milano").strip()
+    ristoranti = params.get("ristoranti")
+    cosa = str(params.get("cosa") or params.get("query") or "").strip()
+    try:
+        quanti = int(params.get("quanti") or 4)
+    except Exception:
+        quanti = 4
+    quanti = max(1, min(quanti, GIRO_MAX))
+
+    key = os.getenv("VAPI_API_KEY", "")
+    gk = os.getenv("GOOGLE_MAPS_API_KEY", "")
+    if not key:
+        return _out({"avviato": False, "messaggio": "Le chiamate in uscita non sono configurate."}, tc)
+    if not persone or not quando:
+        return _out({"avviato": False, "messaggio": "Per quante persone e per quando?"}, tc)
+    if not gk:
+        return _out({"avviato": False, "messaggio": "La ricerca posti non e' attiva."}, tc)
+
+    nomi = []
+    if isinstance(ristoranti, str):
+        nomi = [x.strip() for x in re.split(r"[,;]|\be\b", ristoranti) if x.strip()]
+    elif isinstance(ristoranti, list):
+        nomi = [str(x).strip() for x in ristoranti if str(x).strip()]
+
+    if nomi:
+        cand = await _candidati_da_nomi(gk, nomi[:GIRO_MAX], dove)
+    elif cosa:
+        cand = await _candidati_da_ricerca(gk, cosa, dove, quanti)
+    else:
+        return _out({"avviato": False, "messaggio": "Quali ristoranti chiamo, o cosa cerco?"}, tc)
+
+    if not cand:
+        return _out({"avviato": False, "messaggio": "Non ho trovato numeri da chiamare."}, tc)
+    cand = cand[:GIRO_MAX]
+
+    gid = uuid.uuid4().hex
+    saluto = "Buongiorno" if _now_roma().hour < 13 else "Buonasera"
+    oggi = _now_roma().strftime("%Y-%m-%d")
+    lanciate = 0
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO public.giri_perlustrazione (id, persone, quando, attesi, stato, notificato) "
+            "VALUES ($1,$2,$3,0,'in_corso',false)", gid, persone, quando)
+        for idx, c in enumerate(cand, start=1):
+            body = {
+                "assistantId": PERLUSTRA_ASSISTANT_ID,
+                "phoneNumberId": CALLER_PHONE_ID,
+                "customer": {"number": c["numero"]},
+                "assistantOverrides": {"variableValues": {
+                    "ristorante": c["ristorante"], "persone": persone,
+                    "quando": quando, "saluto": saluto, "oggi": oggi,
+                }},
+                "metadata": {"giro_id": gid},
+            }
+            call_id = None
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as cli:
+                    r = await cli.post(VAPI_CALL_URL,
+                                       headers={"Authorization": "Bearer " + key,
+                                                "Content-Type": "application/json"},
+                                       json=body)
+                if r.status_code in (200, 201):
+                    call_id = (r.json() or {}).get("id")
+                    lanciate += 1
+            except Exception:
+                pass
+            await conn.execute(
+                "INSERT INTO public.giro_chiamate (giro_id, ordine, ristorante, numero, call_id, stato) "
+                "VALUES ($1,$2,$3,$4,$5,$6)",
+                gid, idx, c["ristorante"], c["numero"], call_id,
+                ("in_corso" if call_id else "fallita"))
+        # attesi = solo le chiamate realmente partite (per cui aspettiamo un webhook)
+        await conn.execute(
+            "UPDATE public.giri_perlustrazione SET attesi=$2 WHERE id=$1", gid, lanciate)
+
+    return _out({
+        "avviato": lanciate > 0, "giro_id": gid, "quante": lanciate,
+        "messaggio": (f"Sto chiamando {lanciate} ristoranti per vedere chi ha posto {quando}. "
+                      f"Ti mando il riepilogo appena finisco."
+                      if lanciate > 0 else "Non sono riuscito ad avviare le chiamate."),
+    }, tc)
+
+
+@router.post("/prenota-giro", dependencies=[Depends(check_auth)])
+async def prenota_giro(request: Request, db: asyncpg.Pool = Depends(get_db)):
+    """Fase B — B2: dopo il report, Ilan sceglie 'prenota il N' e Paolo prenota
+    quel ristorante (riusa l'assistente di prenotazione + calendario)."""
+    params, tc = await _in(request)
+    a_nome = str(params.get("a_nome") or "Ilan").strip()
+    try:
+        n = int(params.get("numero_opzione") or params.get("numero") or 0)
+    except Exception:
+        n = 0
+    key = os.getenv("VAPI_API_KEY", "")
+    if not key:
+        return _out({"avviata": False, "messaggio": "Le chiamate non sono configurate."}, tc)
+
+    async with db.acquire() as conn:
+        g = await conn.fetchrow(
+            "SELECT id, persone, quando FROM public.giri_perlustrazione ORDER BY creato_at DESC LIMIT 1")
+        if not g:
+            return _out({"avviata": False, "messaggio": "Non c'e' nessun giro recente."}, tc)
+        disp = await conn.fetch(
+            "SELECT ristorante, numero, orario_proposto FROM public.giro_chiamate "
+            "WHERE giro_id=$1 AND stato='disponibile' ORDER BY ordine", g["id"])
+    if not disp:
+        return _out({"avviata": False, "messaggio": "Nessun ristorante disponibile nell'ultimo giro."}, tc)
+    if n < 1 or n > len(disp):
+        return _out({"avviata": False,
+                     "messaggio": f"Scegli un numero tra 1 e {len(disp)}."}, tc)
+
+    scelto = disp[n - 1]
+    quando = scelto["orario_proposto"] or g["quando"]
+    body = {
+        "assistantId": BOOKING_ASSISTANT_ID,
+        "phoneNumberId": CALLER_PHONE_ID,
+        "customer": {"number": scelto["numero"]},
+        "assistantOverrides": {"variableValues": {
+            "ristorante": scelto["ristorante"], "persone": g["persone"],
+            "quando": quando, "a_nome": a_nome,
+            "saluto": ("Buongiorno" if _now_roma().hour < 13 else "Buonasera"),
+            "oggi": _now_roma().strftime("%Y-%m-%d"),
+        }},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as cli:
+            r = await cli.post(VAPI_CALL_URL,
+                               headers={"Authorization": "Bearer " + key,
+                                        "Content-Type": "application/json"},
+                               json=body)
+        ok = r.status_code in (200, 201)
+    except Exception:
+        ok = False
+    return _out({"avviata": ok, "ristorante": scelto["ristorante"],
+                 "messaggio": (f"Sto chiamando {scelto['ristorante']} per prenotare. "
+                               f"Ti confermo appena ho finito."
+                               if ok else "Non sono riuscito a far partire la chiamata.")}, tc)
