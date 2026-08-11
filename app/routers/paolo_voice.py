@@ -411,6 +411,7 @@ async def prenota(request: Request, db: asyncpg.Pool = Depends(get_db)):
         "assistantOverrides": {"variableValues": {
             "ristorante": ristorante, "persone": persone, "quando": quando, "a_nome": a_nome,
             "saluto": ("Buongiorno" if _now_roma().hour < 13 else "Buonasera"),
+            "oggi": _now_roma().strftime("%Y-%m-%d"),
         }},
     }
     try:
