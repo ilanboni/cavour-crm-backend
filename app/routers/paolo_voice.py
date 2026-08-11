@@ -355,9 +355,11 @@ def _e164_it(n: Optional[str]) -> Optional[str]:
 @router.post("/prenota", dependencies=[Depends(check_auth)])
 async def prenota(request: Request, db: asyncpg.Pool = Depends(get_db)):
     params, tc = await _in(request)
-    ristorante = str(params.get("ristorante") or "").strip() or "il ristorante"
+    tipo = str(params.get("tipo") or "ristorante").strip().lower()
+    luogo = str(params.get("luogo") or params.get("ristorante") or "").strip()
     persone = str(params.get("persone") or "").strip()
     quando = str(params.get("quando") or "").strip()
+    cosa = str(params.get("cosa") or "").strip()
     a_nome = str(params.get("a_nome") or "Ilan").strip()
     dove = str(params.get("dove") or "Milano").strip()
     numero = params.get("numero")
@@ -366,8 +368,10 @@ async def prenota(request: Request, db: asyncpg.Pool = Depends(get_db)):
     key = os.getenv("VAPI_API_KEY", "")
     if not key:
         return _out({"avviata": False, "messaggio": "Le chiamate in uscita non sono ancora configurate."}, tc)
-    if not persone or not quando:
-        return _out({"avviata": False, "messaggio": "Per quante persone e per quando?"}, tc)
+    if not quando:
+        return _out({"avviata": False, "messaggio": "Per quando?"}, tc)
+    if not luogo and not numero and not place_id:
+        return _out({"avviata": False, "messaggio": "Dove devo prenotare?"}, tc)
 
     rest_num = None
     if numero:
@@ -379,32 +383,46 @@ async def prenota(request: Request, db: asyncpg.Pool = Depends(get_db)):
                 d = await _place_details(gk, str(place_id))
                 tel = d.get("international_phone_number") or d.get("formatted_phone_number")
                 rest_num = _e164_it(tel) if tel else None
-                if ristorante == "il ristorante" and d.get("name"):
-                    ristorante = d["name"]
+                if not luogo and d.get("name"):
+                    luogo = d["name"]
             except Exception:
                 pass
-    # Fallback: solo il NOME (es. richiesta da Telegram) -> cerca su Google
-    # (con citta' e poi senza, per trovare posti fuori Milano)
-    if not rest_num and ristorante and ristorante != "il ristorante":
+    # Fallback: solo il NOME -> cerca su Google (con citta' e poi senza, per posti fuori Milano)
+    if not rest_num and luogo:
         gk = os.getenv("GOOGLE_MAPS_API_KEY", "")
         if gk:
-            c = await _trova_numero(gk, ristorante, dove)
+            c = await _trova_numero(gk, luogo, dove)
             if c:
                 rest_num = _e164_it(c["numero"])
                 if c.get("ristorante"):
-                    ristorante = c["ristorante"]
+                    luogo = c["ristorante"]
     if not rest_num:
-        return _out({"avviata": False, "messaggio": "Non ho trovato il numero del ristorante."}, tc)
+        return _out({"avviata": False, "messaggio": f"Non ho trovato il numero di {luogo or 'quel posto'}."}, tc)
+
+    # frase parlata ("cosa") ed etichetta breve ("oggetto") per tipo di prenotazione
+    frasi = {
+        "ristorante": (f"un tavolo per {persone} persone" if persone else "un tavolo"),
+        "tennis": "un campo da tennis", "padel": "un campo da padel",
+        "medico": "una visita", "parrucchiere": "un appuntamento",
+    }
+    etichette = {
+        "ristorante": (f"Tavolo x{persone}" if persone else "Tavolo"),
+        "tennis": "Tennis", "padel": "Padel", "medico": "Visita", "parrucchiere": "Parrucchiere",
+    }
+    if not cosa:
+        cosa = frasi.get(tipo, "un appuntamento")
+    oggetto = etichette.get(tipo) or (cosa[:30].capitalize() if cosa else "Prenotazione")
 
     body = {
         "assistantId": BOOKING_ASSISTANT_ID,
         "phoneNumberId": CALLER_PHONE_ID,
         "customer": {"number": rest_num},
         "assistantOverrides": {"variableValues": {
-            "ristorante": ristorante, "persone": persone, "quando": quando, "a_nome": a_nome,
+            "cosa": cosa, "luogo": luogo, "quando": quando, "a_nome": a_nome,
             "saluto": ("Buongiorno" if _now_roma().hour < 13 else "Buonasera"),
             "oggi": _now_roma().strftime("%Y-%m-%d"),
         }},
+        "metadata": {"tipo": tipo, "luogo": luogo, "oggetto": oggetto, "quando_label": quando},
     }
     try:
         async with httpx.AsyncClient(timeout=15.0) as cli:
@@ -415,8 +433,8 @@ async def prenota(request: Request, db: asyncpg.Pool = Depends(get_db)):
         ok = r.status_code in (200, 201)
     except Exception:
         ok = False
-    return _out({"avviata": ok, "ristorante": ristorante,
-                 "messaggio": (f"Sto chiamando {ristorante}, ti faccio sapere com'e' andata."
+    return _out({"avviata": ok, "luogo": luogo, "ristorante": luogo,
+                 "messaggio": (f"Sto chiamando {luogo} per prenotare {cosa}, {quando}. Ti faccio sapere com'e' andata."
                                if ok else "Non sono riuscito a far partire la chiamata.")}, tc)
 
 
@@ -790,16 +808,21 @@ async def prenota_giro(request: Request, db: asyncpg.Pool = Depends(get_db)):
 
     scelto = disp[n - 1]
     quando = scelto["orario_proposto"] or g["quando"]
+    persone = g["persone"]
+    cosa = f"un tavolo per {persone} persone" if persone else "un tavolo"
+    oggetto = f"Tavolo x{persone}" if persone else "Tavolo"
     body = {
         "assistantId": BOOKING_ASSISTANT_ID,
         "phoneNumberId": CALLER_PHONE_ID,
         "customer": {"number": scelto["numero"]},
         "assistantOverrides": {"variableValues": {
-            "ristorante": scelto["ristorante"], "persone": g["persone"],
+            "cosa": cosa, "luogo": scelto["ristorante"],
             "quando": quando, "a_nome": a_nome,
             "saluto": ("Buongiorno" if _now_roma().hour < 13 else "Buonasera"),
             "oggi": _now_roma().strftime("%Y-%m-%d"),
         }},
+        "metadata": {"tipo": "ristorante", "luogo": scelto["ristorante"],
+                     "oggetto": oggetto, "quando_label": quando},
     }
     try:
         async with httpx.AsyncClient(timeout=15.0) as cli:
