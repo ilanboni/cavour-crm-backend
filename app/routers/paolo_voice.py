@@ -530,6 +530,7 @@ async def chiama(request: Request, db: asyncpg.Pool = Depends(get_db)):
         "assistantOverrides": {"variableValues": {
             "chi": nome_dest, "scopo": scopo, "a_nome": a_nome, "relazione": relazione,
         }},
+        "metadata": {"chi": nome_dest, "scopo": scopo[:120]},
     }
     try:
         async with httpx.AsyncClient(timeout=15.0) as cli:
