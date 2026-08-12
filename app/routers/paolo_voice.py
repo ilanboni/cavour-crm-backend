@@ -831,6 +831,8 @@ def _parse_esegui(s: str):
     s = (s or "").replace("Z", "").strip()
     if not s:
         return None
+    if s.lower() in ("subito", "ora", "adesso", "now"):
+        return datetime.now(ROMA) if ROMA else datetime.now()
     try:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None and ROMA:
