@@ -967,3 +967,47 @@ async def prenota_giro(request: Request, db: asyncpg.Pool = Depends(get_db)):
                  "messaggio": (f"Sto chiamando {scelto['ristorante']} per prenotare. "
                                f"Ti confermo appena ho finito."
                                if ok else "Non sono riuscito a far partire la chiamata.")}, tc)
+
+
+# ----------------------------------------------------------------------------
+# chiama-lead: Paolo telefona SUBITO a un nuovo lead per qualificarlo
+# (speed-to-lead). Assistente Vapi dedicato "Qualifica Lead".
+# ----------------------------------------------------------------------------
+LEAD_ASSISTANT_ID = os.getenv("VAPI_LEAD_ASSISTANT_ID", "")
+
+
+@router.post("/chiama-lead", dependencies=[Depends(check_auth)])
+async def chiama_lead(request: Request, db: asyncpg.Pool = Depends(get_db)):
+    params, tc = await _in(request)
+    nome = str(params.get("nome") or "").strip()
+    numero = params.get("numero") or params.get("telefono")
+    note = str(params.get("note") or "").strip()
+
+    key = os.getenv("VAPI_API_KEY", "")
+    if not key or not LEAD_ASSISTANT_ID:
+        return _out({"avviata": False, "messaggio": "La chiamata ai lead non e' ancora configurata."}, tc)
+    num = _e164_it(str(numero)) if numero else None
+    if not num:
+        return _out({"avviata": False, "messaggio": "Numero del lead mancante o non valido."}, tc)
+
+    saluto = "Buongiorno" if _now_roma().hour < 13 else "Buonasera"
+    body = {
+        "assistantId": LEAD_ASSISTANT_ID,
+        "phoneNumberId": CALLER_PHONE_ID,
+        "customer": {"number": num},
+        "assistantOverrides": {"variableValues": {"nome": (nome or ""), "saluto": saluto}},
+        "metadata": {"lead": True, "nome": nome, "note": note[:120]},
+    }
+    ok = False
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as cli:
+            r = await cli.post(VAPI_CALL_URL,
+                               headers={"Authorization": "Bearer " + key,
+                                        "Content-Type": "application/json"},
+                               json=body)
+        ok = r.status_code in (200, 201)
+    except Exception:
+        ok = False
+    return _out({"avviata": ok, "nome": nome,
+                 "messaggio": (f"Sto chiamando {nome or 'il lead'} per qualificarlo, ti mando l'esito."
+                               if ok else "Non sono riuscito a far partire la chiamata.")}, tc)
