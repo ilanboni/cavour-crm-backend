@@ -996,7 +996,7 @@ async def chiama_lead(request: Request, db: asyncpg.Pool = Depends(get_db)):
         "phoneNumberId": CALLER_PHONE_ID,
         "customer": {"number": num},
         "assistantOverrides": {"variableValues": {"nome": (nome or ""), "saluto": saluto}},
-        "metadata": {"lead": True, "nome": nome, "note": note[:120]},
+        "metadata": {"lead": True, "nome": nome, "telefono": num, "note": note[:120]},
     }
     ok = False
     try:
