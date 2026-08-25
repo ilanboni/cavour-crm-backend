@@ -795,6 +795,40 @@ async def giro(request: Request, db: asyncpg.Pool = Depends(get_db)):
     }, tc)
 
 
+def _durata_chiamata(call: dict) -> int:
+    """Secondi di telefonata. 0 se Vapi non ce li dice."""
+    try:
+        inizio = str(call.get("startedAt") or "").replace("Z", "+00:00")
+        fine = str(call.get("endedAt") or "").replace("Z", "+00:00")
+        if not inizio or not fine:
+            return 0
+        return max(0, int((datetime.fromisoformat(fine) - datetime.fromisoformat(inizio)).total_seconds()))
+    except Exception:
+        return 0
+
+
+def _cliente_ha_parlato(call: dict) -> bool:
+    """True solo se dall'altra parte ha parlato una persona.
+
+    E' la differenza fra 'chiamato' e 'ci ho provato': senza questo, una chiamata
+    caduta nel vuoto e una conversazione vera risultano identiche, e il CRM le
+    archivia allo stesso modo.
+    """
+    messaggi = call.get("messages") or (call.get("artifact") or {}).get("messages") or []
+    for m in messaggi:
+        if not isinstance(m, dict):
+            continue
+        if str(m.get("role") or "").lower() in ("user", "customer", "human"):
+            if str(m.get("message") or m.get("content") or "").strip():
+                return True
+    testo = str(call.get("transcript") or (call.get("artifact") or {}).get("transcript") or "")
+    for riga in testo.splitlines():
+        r = riga.strip().lower()
+        if (r.startswith("user:") or r.startswith("customer:")) and len(r.split(":", 1)[1].strip()) > 1:
+            return True
+    return False
+
+
 @router.post("/call-esito", dependencies=[Depends(check_auth)])
 async def call_esito(request: Request, db: asyncpg.Pool = Depends(get_db)):
     """Ritorna l'esito di una chiamata Vapi (usato dal poller di Paolo, che non
@@ -817,13 +851,16 @@ async def call_esito(request: Request, db: asyncpg.Pool = Depends(get_db)):
         return _out({"pronto": False}, tc)
     sd = (call.get("analysis") or {}).get("structuredData") or {}
     ended = str(call.get("endedReason") or "")
+    extra = {"ended_reason": ended,
+             "durata_sec": _durata_chiamata(call),
+             "cliente_ha_parlato": _cliente_ha_parlato(call)}
     if sd:
         return _out({"pronto": True, "disponibile": bool(sd.get("disponibile")),
                      "orario_proposto": str(sd.get("orario_proposto") or ""),
                      "note": str(sd.get("note") or ""),
-                     "structured": sd, "ended_reason": ended}, tc)
+                     "structured": sd, **extra}, tc)
     return _out({"pronto": True, "disponibile": False, "orario_proposto": "",
-                 "note": ended, "structured": {}, "ended_reason": ended}, tc)
+                 "note": ended, "structured": {}, **extra}, tc)
 
 
 def _parse_esegui(s: str):
@@ -998,7 +1035,12 @@ async def chiama_lead(request: Request, db: asyncpg.Pool = Depends(get_db)):
         "assistantOverrides": {"variableValues": {"nome": (nome or ""), "saluto": saluto}},
         "metadata": {"lead": True, "nome": nome, "telefono": num, "note": note[:120]},
     }
+    # L'id che Vapi assegna alla telefonata va restituito a chi ci ha chiamati.
+    # Senza, il poller del CRM non puo' chiedere com'e' andata davvero e dopo il
+    # timeout scrive "non risposto" su chiunque: il 25/08/2026 sei lead di fila
+    # risultavano tutti irraggiungibili solo perche' questo campo era vuoto.
     ok = False
+    call_id = ""
     try:
         async with httpx.AsyncClient(timeout=15.0) as cli:
             r = await cli.post(VAPI_CALL_URL,
@@ -1006,8 +1048,14 @@ async def chiama_lead(request: Request, db: asyncpg.Pool = Depends(get_db)):
                                         "Content-Type": "application/json"},
                                json=body)
         ok = r.status_code in (200, 201)
+        if ok:
+            try:
+                dati = r.json() or {}
+                call_id = str(dati.get("id") or "")
+            except Exception:
+                call_id = ""
     except Exception:
         ok = False
-    return _out({"avviata": ok, "nome": nome,
+    return _out({"avviata": ok, "nome": nome, "call_id": call_id,
                  "messaggio": (f"Sto chiamando {nome or 'il lead'} per qualificarlo, ti mando l'esito."
                                if ok else "Non sono riuscito a far partire la chiamata.")}, tc)
