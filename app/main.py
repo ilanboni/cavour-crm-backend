@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.config import get_db, close_db
-from app.routers import clienti, immobili, scouting, matching, richieste, coach, voice, paolo_voice
+from app.routers import clienti, immobili, scouting, matching, richieste, coach, voice, paolo_voice, caccia
 from app.routers.operativo import comm_router, appt_router, doc_router
 
 @asynccontextmanager
@@ -32,6 +32,7 @@ app.include_router(richieste.router)
 app.include_router(matching.router)
 app.include_router(scouting.router)
 app.include_router(scouting.scouting_router)
+app.include_router(caccia.router)
 app.include_router(comm_router)
 app.include_router(appt_router)
 app.include_router(doc_router)
