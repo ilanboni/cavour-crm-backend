@@ -1,13 +1,14 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-from app.config import get_db, close_db
+from app.config import get_db, close_db, prova_connessione
 from app.routers import clienti, immobili, scouting, matching, richieste, coach, voice, paolo_voice, caccia
 from app.routers.operativo import comm_router, appt_router, doc_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await get_db()
+    # Non blocca l'avvio: se il database non risponde l'app parte lo stesso.
+    await prova_connessione()
     yield
     await close_db()
 
@@ -46,7 +47,10 @@ async def root():
 
 @app.get("/health")
 async def health():
-    db = await get_db()
-    async with db.acquire() as conn:
-        await conn.fetchval("SELECT 1")
-    return {"status": "healthy", "database": "connected"}
+    try:
+        db = await get_db()
+        async with db.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        return {"status": "healthy", "database": "connected"}
+    except Exception as exc:
+        return {"status": "degraded", "database": "unreachable", "detail": str(exc)[:200]}
