@@ -131,3 +131,22 @@ async def aggiorna_immobile(immobile_id: int, immobile: ImmobileUpdate, db: asyn
     if not row:
         raise HTTPException(status_code=404, detail="Immobile non trovato")
     return dict(row)
+
+
+@router.get("/{immobile_id}/simili")
+async def immobili_simili(immobile_id: int, limit: int = 6, db: asyncpg.Pool = Depends(get_db)):
+    """Immobili simili da mostrare in fondo alla scheda.
+
+    I criteri stanno nella funzione SQL immobili_simili: stesso tipo di
+    contratto, entro 2 km, metratura e prezzo entro il 30%. Dove mancano le
+    coordinate ripiega sulla stessa zona, quindi vale la pena geocodificare.
+    """
+    async with db.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, titolo, sottotitolo, indirizzo, zona, mq, locali, piano, "
+            "tipo_contratto, prezzo, canone_mensile, spese_condominiali, prezzo_display, "
+            "immagini, url_annuncio, riferimento_annuncio "
+            "FROM public.immobili_simili($1, $2)",
+            immobile_id, limit,
+        )
+    return [dict(r) for r in rows]
