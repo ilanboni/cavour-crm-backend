@@ -50,6 +50,9 @@ async def lista(
     punteggio_min: Optional[int] = None,
     solo_con_clienti: bool = False,
     solo_doppi: bool = False,
+    solo_attendibili: bool = True,
+    prezzo_min: Optional[int] = None,
+    max_agenzie: Optional[int] = None,
     search: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
@@ -58,6 +61,19 @@ async def lista(
     conditions = ["TRUE"]
     params = []
     i = 1
+
+    # Qui finisce la Bacheca. Faceva una cosa sola che Caccia non faceva:
+    # buttare via le righe con dati che non tornano, perche' alla seconda
+    # scheda sbagliata di un elenco non ci si fida piu' e tanto vale non
+    # averlo. Ora quel controllo e' una colonna della vista e vale di
+    # default, ma e' un filtro e non una censura: solo_attendibili=false
+    # rimette tutto, motivo_inattendibile dice perche' una riga era fuori.
+    if solo_attendibili:
+        conditions.append("attendibile")
+    if prezzo_min is not None:
+        conditions.append(f"prezzo >= ${i}"); params.append(prezzo_min); i += 1
+    if max_agenzie is not None:
+        conditions.append(f"COALESCE(num_agenzie, 0) <= ${i}"); params.append(max_agenzie); i += 1
 
     if tipo == "vendita":
         conditions.append("e_affitto = FALSE")
@@ -88,7 +104,7 @@ async def lista(
     }.get(ordina, "punteggio DESC")
 
     query = f"""
-        SELECT * FROM public.v_caccia
+        SELECT * FROM public.v_caccia_completa
         WHERE {where}
         ORDER BY {order}
         LIMIT ${i} OFFSET ${i+1}
@@ -98,7 +114,7 @@ async def lista(
     async with db.acquire() as conn:
         rows = await conn.fetch(query, *params)
         total = await conn.fetchval(
-            f"SELECT COUNT(*) FROM public.v_caccia WHERE {where}", *params[:-2]
+            f"SELECT COUNT(*) FROM public.v_caccia_completa WHERE {where}", *params[:-2]
         )
 
     return {"data": [dict(r) for r in rows], "total": total}
@@ -108,10 +124,10 @@ async def lista(
 async def stats(db: asyncpg.Pool = Depends(get_db)):
     async with db.acquire() as conn:
         per_fase = await conn.fetch(
-            "SELECT fase, COUNT(*) AS n FROM public.v_caccia GROUP BY fase ORDER BY n DESC"
+            "SELECT fase, COUNT(*) AS n FROM public.v_caccia_completa GROUP BY fase ORDER BY n DESC"
         )
         aperte = await conn.fetchval(
-            "SELECT COUNT(*) FROM public.v_caccia WHERE fase = ANY($1::text[])",
+            "SELECT COUNT(*) FROM public.v_caccia_completa WHERE fase = ANY($1::text[])",
             list(FASI_APERTE),
         )
         totali = await conn.fetchrow(
@@ -120,7 +136,7 @@ async def stats(db: asyncpg.Pool = Depends(get_db)):
                    COUNT(*) FILTER (WHERE clienti_interessati > 0) AS con_clienti,
                    COUNT(*) FILTER (WHERE doppio_vendita_affitto)  AS doppi,
                    COUNT(*) FILTER (WHERE punteggio >= 70)         AS alta_priorita
-            FROM public.v_caccia
+            FROM public.v_caccia_completa
             """
         )
     return {
@@ -134,13 +150,13 @@ async def stats(db: asyncpg.Pool = Depends(get_db)):
 @router.get("/{immobile_id}")
 async def dettaglio(immobile_id: int, db: asyncpg.Pool = Depends(get_db)):
     async with db.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM public.v_caccia WHERE id = $1", immobile_id)
+        row = await conn.fetchrow("SELECT * FROM public.v_caccia_completa WHERE id = $1", immobile_id)
         if not row:
             raise HTTPException(404, "Immobile non trovato")
         simili = await conn.fetch(
             """
             SELECT id, indirizzo, zona, mq, prezzo, e_affitto, primo_visto
-            FROM public.v_caccia
+            FROM public.v_caccia_completa
             WHERE via_norm = $1 AND id <> $2
             ORDER BY primo_visto DESC LIMIT 10
             """,
@@ -198,6 +214,6 @@ async def aggiorna(immobile_id: int, patch: CacciaPatch, db: asyncpg.Pool = Depe
             f"UPDATE public.immobili_pluricondivisi SET {', '.join(campi)} WHERE id = ${i}",
             *valori,
         )
-        row = await conn.fetchrow("SELECT * FROM public.v_caccia WHERE id = $1", immobile_id)
+        row = await conn.fetchrow("SELECT * FROM public.v_caccia_completa WHERE id = $1", immobile_id)
 
     return dict(row) if row else {"ok": True}
