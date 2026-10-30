@@ -45,6 +45,37 @@ async def lista_immobili_esterni(
     offset: int = 0,
     db: asyncpg.Pool = Depends(get_db)
 ):
+    # 'multiagenzia' non e' un valore di immobili_esterni.tipo_fonte: li dentro
+    # ci sono privato, agenzia e agenzia_singola. Chiederlo restituiva sempre
+    # zero righe, e la dashboard mostrava "nessun immobile multi-agenzia" con
+    # 1.417 pluricondivisi in archivio. I multiagenzia veri stanno in
+    # immobili_pluricondivisi, ricostruita ogni notte confrontando gli annunci.
+    if tipo_fonte == "multiagenzia":
+        cond_p = ["COALESCE(attivo, true) = $1", "COALESCE(num_agenzie, 0) >= 2"]
+        par_p = [attivo]
+        j = 2
+        if zona:
+            cond_p.append(f"zona ILIKE ${j}"); par_p.append(f"%{zona}%"); j += 1
+        if search:
+            cond_p.append(f"(titolo ILIKE ${j} OR indirizzo ILIKE ${j})")
+            par_p.append(f"%{search}%"); j += 1
+        where_p = " AND ".join(cond_p)
+        async with db.acquire() as conn:
+            righe = await conn.fetch(f"""
+                SELECT id, indirizzo, zona, mq, locali, camere, bagni, piano, prezzo,
+                       titolo, num_agenzie, lista_agenzie, giorni_sul_mercato,
+                       proprietario_telefono AS contatto_telefono,
+                       proprietario_nome AS contatto_nome,
+                       'multiagenzia' AS tipo_fonte, fonte, created_at
+                FROM public.immobili_pluricondivisi
+                WHERE {where_p}
+                ORDER BY COALESCE(num_agenzie, 0) DESC, created_at DESC
+                LIMIT ${j} OFFSET ${j+1}
+            """, *par_p, limit, offset)
+            totale = await conn.fetchval(
+                f"SELECT COUNT(*) FROM public.immobili_pluricondivisi WHERE {where_p}", *par_p)
+        return {"data": [dict(r) for r in righe], "total": totale}
+
     conditions = ["attivo = $1"]
     params = [attivo]
     i = 2
@@ -104,7 +135,7 @@ async def lista_multiagenzia(
     db: asyncpg.Pool = Depends(get_db)
 ):
     """Immobili multi-agenzia — opportunità mandato"""
-    conditions = ["tipo_fonte = 'multiagenzia'", "attivo = true"]
+    conditions = ["COALESCE(attivo, true) = true", "COALESCE(num_agenzie, 0) >= 2"]
     params = []
     i = 1
 
@@ -114,7 +145,13 @@ async def lista_multiagenzia(
     where = " AND ".join(conditions)
     async with db.acquire() as conn:
         rows = await conn.fetch(
-            f"SELECT * FROM public.immobili_esterni WHERE {where} ORDER BY score_compatibilita DESC LIMIT ${i}",
+            f"""SELECT id, indirizzo, zona, mq, locali, camere, bagni, piano, prezzo,
+                       titolo, num_agenzie, lista_agenzie, giorni_sul_mercato,
+                       proprietario_telefono AS contatto_telefono,
+                       proprietario_nome AS contatto_nome,
+                       'multiagenzia' AS tipo_fonte, fonte, created_at
+                FROM public.immobili_pluricondivisi WHERE {where}
+                ORDER BY COALESCE(num_agenzie, 0) DESC, created_at DESC LIMIT ${i}""",
             *params, limit
         )
     return [dict(r) for r in rows]
