@@ -134,8 +134,21 @@ async def lista_multiagenzia(
     limit: int = 50,
     db: asyncpg.Pool = Depends(get_db)
 ):
-    """Immobili multi-agenzia — opportunità mandato"""
-    conditions = ["COALESCE(attivo, true) = true", "COALESCE(num_agenzie, 0) >= 2"]
+    """Immobili multi-agenzia — opportunità mandato.
+
+    Il filtro guarda num_agenzie_VERIFICATE, non num_agenzie.
+    num_agenzie e' il conteggio del momento in cui la riga e' stata creata;
+    la verifica notturna ricontrolla gli annunci uno per uno e spesso li trova
+    scaduti. Al 05/11/2026, su 374 righe verificate 230 avevano UNA sola agenzia
+    ancora viva: erano pluricondivisi alla scoperta e non lo sono piu'.
+    Filtrando sul conteggio vecchio si leggevano 1.135 righe di cui tre su
+    cinque morte; filtrando sul verificato se ne leggono 144, tutte vere.
+    """
+    conditions = [
+        "COALESCE(attivo, true) = true",
+        "verifica_esito = 'ok'",
+        "COALESCE(num_agenzie_verificate, 0) >= 2",
+    ]
     params = []
     i = 1
 
@@ -145,13 +158,24 @@ async def lista_multiagenzia(
     where = " AND ".join(conditions)
     async with db.acquire() as conn:
         rows = await conn.fetch(
-            f"""SELECT id, indirizzo, zona, mq, locali, camere, bagni, piano, prezzo,
-                       titolo, num_agenzie, lista_agenzie, giorni_sul_mercato,
+            f"""SELECT id, short_id, indirizzo, civico, zona, mq, locali, camere, bagni,
+                       piano, prezzo,
+                       CASE WHEN COALESCE(mq,0) > 0 THEN ROUND(prezzo / mq) END AS prezzo_mq,
+                       titolo,
+                       num_agenzie_verificate AS num_agenzie,
+                       agenzie_verificate AS lista_agenzie,
+                       annunci_verificati,
+                       JSONB_ARRAY_LENGTH(COALESCE(annunci_verificati,'[]'::jsonb)) AS annunci_vivi,
+                       giorni_sul_mercato,
+                       primo_visto,
+                       (CURRENT_DATE - primo_visto::date) AS giorni_da_scoperta,
+                       verifica_at, mandato_status, contattato_at,
                        proprietario_telefono AS contatto_telefono,
                        proprietario_nome AS contatto_nome,
                        'multiagenzia' AS tipo_fonte, fonte, created_at
                 FROM public.immobili_pluricondivisi WHERE {where}
-                ORDER BY COALESCE(num_agenzie, 0) DESC, created_at DESC LIMIT ${i}""",
+                ORDER BY COALESCE(num_agenzie_verificate, 0) DESC,
+                         primo_visto DESC NULLS LAST LIMIT ${i}""",
             *params, limit
         )
     return [dict(r) for r in rows]
