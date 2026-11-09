@@ -1,4 +1,5 @@
-﻿import asyncpg
+import asyncpg
+import json
 from pydantic_settings import BaseSettings
 from typing import Optional
 import os
@@ -22,6 +23,30 @@ settings = Settings()
 
 _pool: Optional[asyncpg.Pool] = None
 
+def _json_in(valore):
+    """Codifica verso jsonb. Chi passa giá una stringa (molte query fanno
+    json.dumps a mano e poi $n::jsonb) la vedrebbe incapsulata una seconda
+    volta: la lasciamo passare come sta."""
+    if isinstance(valore, str) or valore is None:
+        return valore
+    return json.dumps(valore, ensure_ascii=False)
+
+
+async def _registra_codec(conn: asyncpg.Connection) -> None:
+    """Senza questo asyncpg restituisce jsonb come STRINGA, non come lista o
+    dizionario. Il 09/11/2026 era il motivo per cui cliccare un immobile in
+    Caccia non apriva nulla: il pannello faceva lista_agenzie.join(", ") su
+    una stringa, React lanciava TypeError in fase di render e smontava tutta
+    la pagina. L'API rispondeva 200, quindi nei log non si vedeva niente."""
+    for tipo in ("json", "jsonb"):
+        await conn.set_type_codec(
+            tipo,
+            encoder=_json_in,
+            decoder=json.loads,
+            schema="pg_catalog",
+        )
+
+
 async def crea_pool() -> asyncpg.Pool:
     """Apre il pool. statement_cache_size=0 serve con il pooler di Supabase:
     in transaction mode le query preparate non sopravvivono fra una chiamata e
@@ -32,6 +57,7 @@ async def crea_pool() -> asyncpg.Pool:
         max_size=10,
         command_timeout=60,
         statement_cache_size=0,
+        init=_registra_codec,
     )
 
 
