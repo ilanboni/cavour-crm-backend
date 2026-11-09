@@ -96,12 +96,25 @@ async def lista(
         params.append(f"%{search}%"); i += 1
 
     where = " AND ".join(conditions)
+
+    # Il 09/11/2026 Ilan ha cliccato i link di Corso Italia 16 e non si e'
+    # aperto niente: gli annunci erano spariti dal portale a giugno. Su 1.529
+    # schede attive, 282 non avevano un annuncio rivisto da oltre un mese, e
+    # il CRM non lo diceva da nessuna parte. Una scheda ferma non e' falsa,
+    # e' vecchia: non si nasconde, si manda in coda. Chi non ha nemmeno un
+    # annuncio nel censimento va in fondo del tutto.
+    FRESCHEZZA = (
+        "CASE WHEN giorni_dall_ultimo_annuncio IS NULL THEN 2 "
+        "     WHEN giorni_dall_ultimo_annuncio > 30 THEN 1 "
+        "     ELSE 0 END"
+    )
     order = {
         "acquisizione": "punteggio DESC, clienti_interessati DESC",
         "affare": "punteggio_affare DESC, scarto_pct ASC",
         "recenti": "primo_visto DESC",
         "prezzo": "prezzo DESC NULLS LAST",
     }.get(ordina, "punteggio DESC")
+    order = f"{FRESCHEZZA}, {order}"
 
     query = f"""
         SELECT * FROM public.v_caccia_completa
