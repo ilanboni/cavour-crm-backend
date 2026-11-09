@@ -136,18 +136,31 @@ async def lista_multiagenzia(
 ):
     """Immobili multi-agenzia — opportunità mandato.
 
-    Il filtro guarda num_agenzie_VERIFICATE, non num_agenzie.
-    num_agenzie e' il conteggio del momento in cui la riga e' stata creata;
-    la verifica notturna ricontrolla gli annunci uno per uno e spesso li trova
-    scaduti. Al 05/11/2026, su 374 righe verificate 230 avevano UNA sola agenzia
-    ancora viva: erano pluricondivisi alla scoperta e non lo sono piu'.
-    Filtrando sul conteggio vecchio si leggevano 1.135 righe di cui tre su
-    cinque morte; filtrando sul verificato se ne leggono 144, tutte vere.
+    SI MOSTRA TUTTO, SI ORDINA PER AFFIDABILITA'. Non si nasconde.
+
+    Il 06/11/2026 il filtro era stato stretto a verifica_esito = 'ok' e
+    num_agenzie_verificate >= 2, perche' su 374 righe verificate 230 avevano
+    una sola agenzia ancora viva: erano pluricondivisi alla scoperta e non lo
+    erano piu'. La stretta era giusta nel merito e sbagliata nella forma.
+
+    Il 09/11/2026, dopo la correzione della paginazione, le righe attive sono
+    diventate 1.739 e quelle visibili con quel filtro 37. Milletrecentosessanta
+    candidati con due o piu' agenzie restavano invisibili perche' la verifica
+    notturna non li aveva ancora toccati, e quella verifica non girava dal 7.
+    Un filtro che dipende da un job fermo non filtra: nasconde.
+
+    Quindi ora la lista mostra tutto cio' che e' attivo e ha due o piu'
+    agenzie, verificate quando il dato c'e' e dichiarate quando non c'e'
+    ancora, e porta per ogni riga lo stato della verifica. In cima stanno i
+    confermati, poi i non ancora verificati, poi quelli che la verifica ha
+    declassato. Chi legge decide con il dato davanti invece di non vedere
+    niente.
     """
     conditions = [
         "COALESCE(attivo, true) = true",
-        "verifica_esito = 'ok'",
-        "COALESCE(num_agenzie_verificate, 0) >= 2",
+        "GREATEST(COALESCE(num_agenzie_verificate, 0), COALESCE(num_agenzie, 0)) >= 2",
+        "(verifica_esito IS NULL OR verifica_esito = 'ok'"
+        " OR COALESCE(num_agenzie_verificate, 0) >= 2)",
     ]
     params = []
     i = 1
@@ -162,8 +175,15 @@ async def lista_multiagenzia(
                        piano, prezzo,
                        CASE WHEN COALESCE(mq,0) > 0 THEN ROUND(prezzo / mq) END AS prezzo_mq,
                        titolo,
-                       num_agenzie_verificate AS num_agenzie,
-                       agenzie_verificate AS lista_agenzie,
+                       COALESCE(num_agenzie_verificate, num_agenzie) AS num_agenzie,
+                       COALESCE(agenzie_verificate, lista_agenzie) AS lista_agenzie,
+                       CASE
+                         WHEN verifica_esito = 'ok' AND COALESCE(num_agenzie_verificate,0) >= 2
+                           THEN 'verificato'
+                         WHEN verifica_at IS NULL THEN 'da verificare'
+                         ELSE 'declassato'
+                       END AS stato_verifica,
+                       verifica_esito,
                        annunci_verificati,
                        JSONB_ARRAY_LENGTH(COALESCE(annunci_verificati,'[]'::jsonb)) AS annunci_vivi,
                        giorni_sul_mercato,
@@ -174,7 +194,12 @@ async def lista_multiagenzia(
                        proprietario_nome AS contatto_nome,
                        'multiagenzia' AS tipo_fonte, fonte, created_at
                 FROM public.immobili_pluricondivisi WHERE {where}
-                ORDER BY COALESCE(num_agenzie_verificate, 0) DESC,
+                ORDER BY CASE
+                           WHEN verifica_esito = 'ok' AND COALESCE(num_agenzie_verificate,0) >= 2 THEN 0
+                           WHEN verifica_at IS NULL THEN 1
+                           ELSE 2
+                         END,
+                         GREATEST(COALESCE(num_agenzie_verificate,0), COALESCE(num_agenzie,0)) DESC,
                          primo_visto DESC NULLS LAST LIMIT ${i}""",
             *params, limit
         )
