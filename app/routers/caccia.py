@@ -32,6 +32,7 @@ TETTO_IN_CACCIA = 10
 
 class CacciaPatch(BaseModel):
     fase: Optional[str] = None
+    preferito: Optional[bool] = None
     proprietario_nome: Optional[str] = None
     proprietario_cognome: Optional[str] = None
     proprietario_telefono: Optional[str] = None
@@ -39,6 +40,23 @@ class CacciaPatch(BaseModel):
     proprietario_note: Optional[str] = None
     esito_finale: Optional[str] = None
     attivo: Optional[bool] = None
+
+
+class AttivitaIn(BaseModel):
+    testo: str
+    scadenza: Optional[str] = None
+
+
+class AttivitaPatch(BaseModel):
+    testo: Optional[str] = None
+    fatto: Optional[bool] = None
+    scadenza: Optional[str] = None
+
+
+class AnnuncioManualeIn(BaseModel):
+    url: str
+    agenzia: Optional[str] = None
+    nota: Optional[str] = None
 
 
 @router.get("")
@@ -50,6 +68,7 @@ async def lista(
     punteggio_min: Optional[int] = None,
     solo_con_clienti: bool = False,
     solo_doppi: bool = False,
+    solo_preferiti: bool = False,
     solo_attendibili: bool = True,
     prezzo_min: Optional[int] = None,
     max_agenzie: Optional[int] = None,
@@ -91,6 +110,8 @@ async def lista(
         conditions.append("clienti_interessati > 0")
     if solo_doppi:
         conditions.append("doppio_vendita_affitto = TRUE")
+    if solo_preferiti:
+        conditions.append("preferito")
     if search:
         conditions.append(f"(indirizzo ILIKE ${i} OR zona ILIKE ${i})")
         params.append(f"%{search}%"); i += 1
@@ -114,7 +135,9 @@ async def lista(
         "recenti": "primo_visto DESC",
         "prezzo": "prezzo DESC NULLS LAST",
     }.get(ordina, "punteggio DESC")
-    order = f"{FRESCHEZZA}, {order}"
+    # I preferiti in cima sempre: se Ilan ne ha messo uno da parte, non deve
+    # ritrovarlo in fondo perche' i suoi annunci sono vecchi di un mese.
+    order = f"preferito DESC, {FRESCHEZZA}, {order}"
 
     query = f"""
         SELECT * FROM public.v_caccia_completa
@@ -175,7 +198,24 @@ async def dettaglio(immobile_id: int, db: asyncpg.Pool = Depends(get_db)):
             """,
             row["via_norm"], immobile_id,
         )
-    return {"immobile": dict(row), "stessa_via": [dict(r) for r in simili]}
+        attivita = await conn.fetch(
+            "SELECT id, testo, fatto, fatto_at, scadenza, created_at "
+            "FROM public.caccia_attivita WHERE pluricondiviso_id = $1 "
+            "ORDER BY fatto, scadenza NULLS LAST, ordine, id",
+            immobile_id,
+        )
+        manuali = await conn.fetch(
+            "SELECT id, url, agenzia, nota, created_at "
+            "FROM public.caccia_annunci_manuali WHERE pluricondiviso_id = $1 "
+            "ORDER BY id",
+            immobile_id,
+        )
+    return {
+        "immobile": dict(row),
+        "stessa_via": [dict(r) for r in simili],
+        "attivita": [dict(r) for r in attivita],
+        "annunci_manuali": [dict(r) for r in manuali],
+    }
 
 
 @router.patch("/{immobile_id}")
@@ -213,6 +253,10 @@ async def aggiorna(immobile_id: int, patch: CacciaPatch, db: asyncpg.Pool = Depe
                 )
 
         campi, valori, i = [], [], 1
+        if "preferito" in dati:
+            campi.append("preferito_at = CASE WHEN "
+                         f"${i}::boolean THEN COALESCE(preferito_at, NOW()) ELSE NULL END")
+            valori.append(bool(dati["preferito"])); i += 1
         if fase:
             campi.append(f"mandato_status = ${i}"); valori.append(fase); i += 1
             campi.append(f"mandato_status_updated_at = NOW()")
@@ -230,3 +274,110 @@ async def aggiorna(immobile_id: int, patch: CacciaPatch, db: asyncpg.Pool = Depe
         row = await conn.fetchrow("SELECT * FROM public.v_caccia_completa WHERE id = $1", immobile_id)
 
     return dict(row) if row else {"ok": True}
+
+
+# ─── Attivita': cosa c'e' da fare su una scheda ────────────────────────────────
+# mandato_status dice a che punto e' la trattativa. Questa e' la lista delle
+# cose concrete che mancano per andare avanti, che prima vivevano nella testa
+# di Ilan e si perdevano fra una scheda e l'altra.
+
+@router.post("/{immobile_id}/attivita", status_code=201)
+async def crea_attivita(immobile_id: int, dati: AttivitaIn,
+                        db: asyncpg.Pool = Depends(get_db)):
+    testo = (dati.testo or "").strip()
+    if not testo:
+        raise HTTPException(400, "Il testo non puo' essere vuoto")
+    async with db.acquire() as conn:
+        esiste = await conn.fetchval(
+            "SELECT 1 FROM public.immobili_pluricondivisi WHERE id = $1", immobile_id)
+        if not esiste:
+            raise HTTPException(404, "Immobile non trovato")
+        row = await conn.fetchrow(
+            "INSERT INTO public.caccia_attivita (pluricondiviso_id, testo, scadenza, ordine) "
+            "VALUES ($1, $2, $3::date, "
+            "  COALESCE((SELECT MAX(ordine) + 1 FROM public.caccia_attivita "
+            "            WHERE pluricondiviso_id = $1), 0)) "
+            "RETURNING id, testo, fatto, fatto_at, scadenza, created_at",
+            immobile_id, testo, dati.scadenza,
+        )
+    return dict(row)
+
+
+@router.patch("/attivita/{attivita_id}")
+async def aggiorna_attivita(attivita_id: int, patch: AttivitaPatch,
+                            db: asyncpg.Pool = Depends(get_db)):
+    dati = patch.model_dump(exclude_unset=True)
+    if not dati:
+        raise HTTPException(400, "Niente da aggiornare")
+    campi, valori, i = [], [], 1
+    if "testo" in dati:
+        testo = (dati["testo"] or "").strip()
+        if not testo:
+            raise HTTPException(400, "Il testo non puo' essere vuoto")
+        campi.append(f"testo = ${i}"); valori.append(testo); i += 1
+    if "scadenza" in dati:
+        campi.append(f"scadenza = ${i}::date"); valori.append(dati["scadenza"]); i += 1
+    if "fatto" in dati:
+        campi.append(f"fatto = ${i}"); valori.append(bool(dati["fatto"])); i += 1
+        campi.append(f"fatto_at = CASE WHEN ${i}::boolean THEN NOW() ELSE NULL END")
+        valori.append(bool(dati["fatto"])); i += 1
+    valori.append(attivita_id)
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            f"UPDATE public.caccia_attivita SET {', '.join(campi)} WHERE id = ${i} "
+            "RETURNING id, testo, fatto, fatto_at, scadenza, created_at",
+            *valori,
+        )
+    if not row:
+        raise HTTPException(404, "Attivita' non trovata")
+    return dict(row)
+
+
+@router.delete("/attivita/{attivita_id}", status_code=204)
+async def elimina_attivita(attivita_id: int, db: asyncpg.Pool = Depends(get_db)):
+    async with db.acquire() as conn:
+        esito = await conn.execute(
+            "DELETE FROM public.caccia_attivita WHERE id = $1", attivita_id)
+    if esito.endswith("0"):
+        raise HTTPException(404, "Attivita' non trovata")
+
+
+# ─── Annunci trovati a mano ───────────────────────────────────────────────────
+# Non finiscono in listing_urls di proposito: quella colonna la riscrivono i
+# job di raggruppamento, e la verifica notturna apre ogni URL che ci trova,
+# spende credito Apify e puo' declassare la scheda se l'indirizzo non
+# combacia. Un annuncio aggiunto per cercare il proprietario non e' una prova
+# di pluricondivisione e non tocca num_agenzie ne' il punteggio.
+
+@router.post("/{immobile_id}/annunci", status_code=201)
+async def aggiungi_annuncio(immobile_id: int, dati: AnnuncioManualeIn,
+                            db: asyncpg.Pool = Depends(get_db)):
+    url = (dati.url or "").strip()
+    if not url.lower().startswith(("http://", "https://")):
+        raise HTTPException(400, "Serve un indirizzo che cominci con http")
+    async with db.acquire() as conn:
+        esiste = await conn.fetchval(
+            "SELECT 1 FROM public.immobili_pluricondivisi WHERE id = $1", immobile_id)
+        if not esiste:
+            raise HTTPException(404, "Immobile non trovato")
+        try:
+            row = await conn.fetchrow(
+                "INSERT INTO public.caccia_annunci_manuali "
+                "(pluricondiviso_id, url, agenzia, nota) VALUES ($1, $2, $3, $4) "
+                "RETURNING id, url, agenzia, nota, created_at",
+                immobile_id, url,
+                (dati.agenzia or "").strip() or None,
+                (dati.nota or "").strip() or None,
+            )
+        except asyncpg.UniqueViolationError:
+            raise HTTPException(409, "Questo annuncio e' gia' sulla scheda")
+    return dict(row)
+
+
+@router.delete("/annunci/{annuncio_id}", status_code=204)
+async def elimina_annuncio(annuncio_id: int, db: asyncpg.Pool = Depends(get_db)):
+    async with db.acquire() as conn:
+        esito = await conn.execute(
+            "DELETE FROM public.caccia_annunci_manuali WHERE id = $1", annuncio_id)
+    if esito.endswith("0"):
+        raise HTTPException(404, "Annuncio non trovato")
