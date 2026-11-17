@@ -59,6 +59,11 @@ class AnnuncioManualeIn(BaseModel):
     nota: Optional[str] = None
 
 
+class EsclusioneIn(BaseModel):
+    url: str
+    motivo: Optional[str] = None
+
+
 @router.get("")
 async def lista(
     ordina: str = "acquisizione",
@@ -210,11 +215,17 @@ async def dettaglio(immobile_id: int, db: asyncpg.Pool = Depends(get_db)):
             "ORDER BY id",
             immobile_id,
         )
+        esclusi = await conn.fetch(
+            "SELECT url, motivo, created_at FROM public.caccia_annunci_esclusi "
+            "WHERE pluricondiviso_id = $1 ORDER BY created_at DESC",
+            immobile_id,
+        )
     return {
         "immobile": dict(row),
         "stessa_via": [dict(r) for r in simili],
         "attivita": [dict(r) for r in attivita],
         "annunci_manuali": [dict(r) for r in manuali],
+        "annunci_esclusi": [dict(r) for r in esclusi],
     }
 
 
@@ -381,3 +392,147 @@ async def elimina_annuncio(annuncio_id: int, db: asyncpg.Pool = Depends(get_db))
             "DELETE FROM public.caccia_annunci_manuali WHERE id = $1", annuncio_id)
     if esito.endswith("0"):
         raise HTTPException(404, "Annuncio non trovato")
+
+
+# ─── annunci che non sono lo stesso immobile ────────────────────────────────
+#
+# Il raggruppamento confronta via, civico, metri e prezzo. Due appartamenti
+# uguali nello stesso stabile sono indistinguibili per qualunque regola: lo
+# vede solo chi apre i due annunci e guarda le foto. Qui Ilan lo dice al CRM.
+#
+# L'esclusione sta sull'URL in una tabella sua, non dentro la riga, perche' il
+# job notturno ricostruisce i gruppi da zero dagli annunci censiti: se stesse
+# sulla riga, l'annuncio tornerebbe dentro stanotte.
+
+def _senza(lista, url):
+    """Toglie un URL da un campo jsonb che puo' essere lista, stringa o nulla."""
+    import json
+    if isinstance(lista, str):
+        try:
+            lista = json.loads(lista)
+        except Exception:
+            lista = []
+    if not isinstance(lista, list):
+        return []
+    fuori = []
+    for v in lista:
+        if isinstance(v, dict):
+            if (v.get("url") or "") != url:
+                fuori.append(v)
+        elif v != url:
+            fuori.append(v)
+    return fuori
+
+
+@router.post("/{immobile_id}/annunci/escludi")
+async def escludi_annuncio(immobile_id: int, dati: EsclusioneIn,
+                           db: asyncpg.Pool = Depends(get_db)):
+    import json
+    url = (dati.url or "").strip()
+    if not url:
+        raise HTTPException(400, "Serve l'indirizzo dell'annuncio")
+
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, listing_urls, annunci_dettagli, annunci_verificati, "
+            "annunci_scaduti, annunci_discordi, lista_agenzie, attivo "
+            "FROM public.immobili_pluricondivisi WHERE id = $1", immobile_id)
+        if not row:
+            raise HTTPException(404, "Immobile non trovato")
+
+        urls = _senza(row["listing_urls"], url)
+        dett = _senza(row["annunci_dettagli"], url)
+
+        # Le agenzie si ricontano SOLO se conosciamo l'agenzia di ogni annuncio
+        # rimasto. Se di qualcuno non sappiamo chi lo pubblica, riscrivere la
+        # lista vorrebbe dire inventarsi che non esiste: meglio lasciarla com'e'
+        # e correggerla stanotte, quando la verifica rilegge tutto.
+        noti = {(d.get("url") or "") for d in dett if isinstance(d, dict)}
+        agenzie = None
+        if urls and noti >= set(urls):
+            viste = []
+            for d in dett:
+                nome = (d.get("agenzia") or "").strip() if isinstance(d, dict) else ""
+                if nome and nome not in viste:
+                    viste.append(nome)
+            agenzie = viste
+
+        # Sotto i due annunci non e' piu' un pluricondiviso: e' un immobile con
+        # un'agenzia sola, e non ha niente da fare in questa lista.
+        resta_pluri = len(urls) >= 2 and (agenzie is None or len(agenzie) >= 2)
+
+        patch = {
+            "listing_urls": json.dumps(urls),
+            "annunci_dettagli": json.dumps(dett),
+            "annunci_verificati": json.dumps(_senza(row["annunci_verificati"], url)),
+            "annunci_scaduti": json.dumps(_senza(row["annunci_scaduti"], url)),
+            "annunci_discordi": json.dumps(_senza(row["annunci_discordi"], url)),
+        }
+        if agenzie is not None:
+            patch["lista_agenzie"] = json.dumps(agenzie)
+            patch["num_agenzie"] = len(agenzie)
+
+        async with conn.transaction():
+            await conn.execute(
+                "INSERT INTO public.caccia_annunci_esclusi (url, pluricondiviso_id, motivo) "
+                "VALUES ($1, $2, $3) ON CONFLICT (url) DO UPDATE "
+                "SET pluricondiviso_id = EXCLUDED.pluricondiviso_id, motivo = EXCLUDED.motivo",
+                url, immobile_id, (dati.motivo or "").strip() or None)
+
+            campi = ", ".join(f"{k} = ${i + 2}" for i, k in enumerate(patch))
+            valori = [immobile_id] + [patch[k] for k in patch]
+            await conn.execute(
+                f"UPDATE public.immobili_pluricondivisi SET {campi}, updated_at = now() "
+                f"WHERE id = $1", *valori)
+
+            if not resta_pluri:
+                motivo = (f"Chiuso il {_oggi()}: Ilan ha escluso un annuncio perche' non "
+                          f"e' lo stesso immobile, e restano "
+                          + (f"{len(urls)} annunci" if len(urls) != 1 else "un annuncio solo")
+                          + (f" di una sola agenzia" if agenzie and len(agenzie) < 2 else "")
+                          + ". Non e' piu' un pluricondiviso.")
+                await conn.execute(
+                    "UPDATE public.immobili_pluricondivisi "
+                    "SET attivo = false, stato = 'chiuso', esito_finale = $2, updated_at = now() "
+                    "WHERE id = $1", immobile_id, motivo)
+
+        aggiornata = await conn.fetchrow(
+            "SELECT * FROM public.v_caccia_completa WHERE id = $1", immobile_id)
+
+    return {
+        "immobile": dict(aggiornata) if aggiornata else None,
+        "annunci_rimasti": len(urls),
+        "ancora_pluricondiviso": resta_pluri,
+    }
+
+
+@router.post("/{immobile_id}/annunci/ripristina")
+async def ripristina_annuncio(immobile_id: int, dati: EsclusioneIn,
+                              db: asyncpg.Pool = Depends(get_db)):
+    """Annulla un'esclusione. I numeri li rimette a posto la verifica notturna."""
+    import json
+    url = (dati.url or "").strip()
+    if not url:
+        raise HTTPException(400, "Serve l'indirizzo dell'annuncio")
+    async with db.acquire() as conn:
+        esito = await conn.execute(
+            "DELETE FROM public.caccia_annunci_esclusi WHERE url = $1", url)
+        if esito.endswith("0"):
+            raise HTTPException(404, "Questo annuncio non era escluso")
+        row = await conn.fetchrow(
+            "SELECT listing_urls FROM public.immobili_pluricondivisi WHERE id = $1",
+            immobile_id)
+        if not row:
+            raise HTTPException(404, "Immobile non trovato")
+        urls = _senza(row["listing_urls"], url) + [url]
+        await conn.execute(
+            "UPDATE public.immobili_pluricondivisi "
+            "SET listing_urls = $2, attivo = $3, updated_at = now() WHERE id = $1",
+            immobile_id, json.dumps(urls), len(urls) >= 2)
+    return {"annunci": len(urls), "ancora_pluricondiviso": len(urls) >= 2}
+
+
+def _oggi():
+    from datetime import date
+    return date.today().strftime("%d/%m/%Y")
+
