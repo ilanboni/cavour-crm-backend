@@ -851,9 +851,14 @@ async def call_esito(request: Request, db: asyncpg.Pool = Depends(get_db)):
         return _out({"pronto": False}, tc)
     sd = (call.get("analysis") or {}).get("structuredData") or {}
     ended = str(call.get("endedReason") or "")
+    # Il riassunto serve al poller di Paolo per decidere caldo/freddo quando il
+    # webhook di fine chiamata non arriva: senza, l'unica strada era aspettare
+    # un webhook che non arrivava mai.
+    summary = str((call.get("analysis") or {}).get("summary") or call.get("summary") or "").strip()
     extra = {"ended_reason": ended,
              "durata_sec": _durata_chiamata(call),
-             "cliente_ha_parlato": _cliente_ha_parlato(call)}
+             "cliente_ha_parlato": _cliente_ha_parlato(call),
+             "summary": summary}
     if sd:
         return _out({"pronto": True, "disponibile": bool(sd.get("disponibile")),
                      "orario_proposto": str(sd.get("orario_proposto") or ""),
