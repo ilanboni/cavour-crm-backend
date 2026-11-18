@@ -23,6 +23,10 @@ settings = Settings()
 
 _pool: Optional[asyncpg.Pool] = None
 
+# Quando aprire il pool fallisce, non si ritenta a ogni richiesta.
+PAUSA_RICONNESSIONE = 10.0  # secondi
+_ultimo_tentativo_pool: float = -1e9
+
 def _json_in(valore):
     """Codifica verso jsonb. Chi passa giá una stringa (molte query fanno
     json.dumps a mano e poi $n::jsonb) la vedrebbe incapsulata una seconda
@@ -71,17 +75,35 @@ async def get_db() -> asyncpg.Pool:
     e' rimasto giu' per ore e sistemare la variabile non bastava piu'.
     Meglio un'applicazione viva che risponde male su alcune rotte.
     """
-    global _pool
-    if _pool is None:
-        _pool = await crea_pool()
+    global _pool, _ultimo_tentativo_pool
+    if _pool is not None:
+        return _pool
+    # Pausa fra i tentativi di aprire il pool. Senza, ogni richiesta che arriva
+    # mentre il database e' giu' prova a riconnettersi: e' esattamente la
+    # tempesta che l'8 ottobre ha portato Supabase a rispondere "too many
+    # authentication failures" e ha reso inutile sistemare la variabile.
+    import time as _t
+    adesso = _t.monotonic()
+    if adesso - _ultimo_tentativo_pool < PAUSA_RICONNESSIONE:
+        raise ConnectionError(
+            "database non raggiungibile: nuovo tentativo fra "
+            f"{PAUSA_RICONNESSIONE - (adesso - _ultimo_tentativo_pool):.0f}s"
+        )
+    _ultimo_tentativo_pool = adesso
+    _pool = await crea_pool()
     return _pool
 
 
 async def prova_connessione(tentativi: int = 3, attesa: float = 3.0) -> bool:
     """Tentativi distanziati all'avvio. Se falliscono, l'app parte lo stesso."""
     import asyncio
+    global _ultimo_tentativo_pool
     for n in range(1, tentativi + 1):
         try:
+            # L'avvio scavalca la pausa di riconnessione: i tentativi qui sono
+            # pochi, distanziati e voluti, e senza questa riga il secondo e il
+            # terzo verrebbero rifiutati dalla pausa invece di provare davvero.
+            _ultimo_tentativo_pool = -1e9
             await get_db()
             return True
         except Exception as exc:

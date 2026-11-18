@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.config import get_db, close_db, prova_connessione
+from app.resilienza import degrada_con_grazia
 from app.routers import clienti, immobili, scouting, matching, richieste, coach, voice, paolo_voice, caccia
 from app.routers.operativo import comm_router, appt_router, doc_router
 
@@ -25,7 +26,16 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Senza expose_headers il browser NON fa vedere a React le intestazioni
+    # nostre: la fascia "dati vecchi" non comparirebbe mai, e il bug sarebbe
+    # invisibile perche' la risposta arriva comunque.
+    expose_headers=["X-Degradato", "X-Dati-Vecchi"],
 )
+
+# Quando il database non risponde, i GET servono l'ultima copia buona con le
+# intestazioni X-Degradato e X-Dati-Vecchi invece di una schermata vuota.
+# Il perche' sta in cima a app/resilienza.py.
+app.middleware("http")(degrada_con_grazia)
 
 app.include_router(clienti.router)
 app.include_router(immobili.router)
