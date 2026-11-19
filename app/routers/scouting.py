@@ -76,6 +76,46 @@ async def lista_immobili_esterni(
                 f"SELECT COUNT(*) FROM public.immobili_pluricondivisi WHERE {where_p}", *par_p)
         return {"data": [dict(r) for r in righe], "total": totale}
 
+    # Lo stock delle agenzie che non lavorano in esclusiva. Sta in
+    # immobili_esterni come tutto il resto, ma con stato_contatto
+    # 'stock_agenzia'. Quello stato serve a tenere il telefono DELL'AGENZIA
+    # fuori dai target privati (lo pretende trg_sync_immobili_esterni, ed e'
+    # cosi' che fra i privati erano finiti Gabetti e Savills), e come effetto
+    # collaterale nasconde queste righe da questa pagina, che di suo chiede
+    # sempre stato_contatto='nuovo'. Qui lo stato quindi non si filtra.
+    #
+    # L'ordine e' da quanto l'annuncio e' fermo, dal piu' vecchio: un
+    # proprietario che aspetta da mesi con un'agenzia che non fa esclusive e'
+    # quello che ascolta. data_pubblicazione e' testo e in ISO si ordina da
+    # sola, ma il cast va protetto perche' le righe di altre fonti la'
+    # dentro hanno altro o niente.
+    if tipo_fonte == "non_esclusive":
+        cond_n = ["COALESCE(e.attivo, true) = $1", "e.stato_contatto = 'stock_agenzia'"]
+        par_n = [attivo]
+        j = 2
+        if zona:
+            cond_n.append(f"e.zona ILIKE ${j}"); par_n.append(f"%{zona}%"); j += 1
+        if search:
+            cond_n.append(f"(e.titolo ILIKE ${j} OR e.indirizzo ILIKE ${j})")
+            par_n.append(f"%{search}%"); j += 1
+        where_n = " AND ".join(cond_n)
+        giorni = ("CASE WHEN e.data_pubblicazione ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' "
+                  "THEN (CURRENT_DATE - LEFT(e.data_pubblicazione, 10)::date) END")
+        async with db.acquire() as conn:
+            righe = await conn.fetch(f"""
+                SELECT e.*, {giorni} AS giorni_fermo,
+                       a.nome AS agenzia, a.quota AS quota_condivisi
+                FROM public.immobili_esterni e
+                LEFT JOIN public.agenzie_non_esclusive a
+                       ON a.nome = e.agenzie_coinvolte->>0
+                WHERE {where_n}
+                ORDER BY {giorni} DESC NULLS LAST, e.created_at DESC
+                LIMIT ${j} OFFSET ${j+1}
+            """, *par_n, limit, offset)
+            totale = await conn.fetchval(
+                f"SELECT COUNT(*) FROM public.immobili_esterni e WHERE {where_n}", *par_n)
+        return {"data": [dict(r) for r in righe], "total": totale}
+
     conditions = ["attivo = $1"]
     params = [attivo]
     i = 2
